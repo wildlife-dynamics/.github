@@ -1,0 +1,24 @@
+repos:
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 0.37.2
+    hooks:
+      - id: check-jsonschema
+        name: Validate GitHub issue forms
+        args:
+          - --schemafile
+          - https://json.schemastore.org/github-issue-forms.json
+        files: ^\.github/ISSUE_TEMPLATE/(?:Bug|Feature)\.yml$
+
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.28.0
+    hooks:
+      - id: zizmor
+        args:
+          - .
+        files: ^\.github/(?:workflows/.*\.ya?ml|zizmor\.yml)$
+        pass_filenames: false

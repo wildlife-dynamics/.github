@@ -23,7 +23,7 @@ Usage and caller examples are documented at the top of each workflow.
 ## Contributing
 
 - Reusable workflow names should start with `_`.
-- Validate workflow
-changes with `actionlint` and update the workflow's usage comments whenever its
-inputs or behavior change.
-
+- After installing `pre-commit`, enable the local checks with
+  `pre-commit install`.
+- Run all local checks manually with `pre-commit run --all-files`.
+- Update a workflow's usage comments whenever its inputs or behavior change.
