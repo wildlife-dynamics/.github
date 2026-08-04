@@ -1,0 +1,38 @@
+name: Feature
+description: Propose a new capability
+type: Feature
+
+body:
+  - type: textarea
+    id: user-story
+    attributes:
+      label: User story
+      placeholder: |
+        AS A ...
+        I WANT ...
+        SO THAT ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Optional additional context.
+    validations:
+      required: false
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Optional acceptance and regression criteria.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+
+        ### Regression
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: false

@@ -1,0 +1,58 @@
+name: Check PRs mention a linked issue with a sufficient description
+
+on:
+  workflow_call:
+    inputs:
+      pr_body:
+        required: true
+        type: string
+      min_issue_description_length:
+        description: Minimum number of characters required in the linked issue description
+        required: false
+        type: number
+        default: 30
+
+jobs:
+  check-linked-issue:
+    if: github.event.pull_request.user.login != 'ecoscope-elebot' && github.event.pull_request.user.login != 'dependabot'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+    steps:
+      - name: Verify Linked Issue has a sufficient description
+        uses: actions/github-script@v6
+        env:
+          pr_body: ${{ inputs.pr_body }}
+          min_issue_description_length: ${{ inputs.min_issue_description_length }}
+        with:
+          script: |
+            const prBody = process.env.pr_body || '';
+            const { owner, repo } = context.repo;
+
+            const issuePattern = `(?:closes|closes|closed|fix|fixes|fixed|resolve|resolves|resolved|relates to|related to|towards\)\\s+(?:(?:(?:${owner}\/${repo})?#)|(?:(?:https:\/\/github\.com\/)?${owner}\/${repo}\/issues\/))?(\\d+)`
+            const issuePatternRegexp = new RegExp(issuePattern, 'i');
+            const matches = issuePatternRegexp.exec(prBody);
+
+            if (!matches) {
+              core.setFailed('No linked issue found in the pull request description.');
+              return;
+            }
+
+            const issueNumber = parseInt(matches[1], 10);
+
+            try {
+              const issue = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: issueNumber
+              });
+              const minIssueDescriptionLength = Number(process.env.min_issue_description_length);
+
+              if (!issue.data.body || issue.data.body.trim().length < minIssueDescriptionLength) {
+                core.setFailed(`Linked issue #${issueNumber} does not have a sufficient description (at least ${minIssueDescriptionLength} characters required).`);
+              } else {
+                console.log(`Linked issue #${issueNumber} has a sufficient description.`);
+              }
+            } catch (error) {
+              core.setFailed(`Issue #${issueNumber} not found or inaccessible. Does it exist on the ${owner}/${repo} repository?`);
+            }

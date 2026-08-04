@@ -1,0 +1,179 @@
+name: Initialize Ready for Refinement field to NO on Features and Bugs
+
+on:
+  workflow_call:
+
+permissions:
+  issues: write
+
+concurrency:
+  group: initialize-ready-for-refinement-on-features-bugs-${{ github.repository }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  initialize:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Initialize refinement and notify QA
+        uses: actions/github-script@v9
+        env:
+          READY_FOR_REFINEMENT_FIELD_ID: "44324267"
+          QA_MENTION: "@davidovichmarcos"
+
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issueNumber = context.issue.number;
+            const action = context.payload.action;
+            const fieldId = Number(
+              process.env.READY_FOR_REFINEMENT_FIELD_ID
+            );
+
+            if (!Number.isInteger(fieldId) || fieldId <= 0) {
+              core.setFailed(
+                "READY_FOR_REFINEMENT_FIELD_ID must be the numeric issue field ID."
+              );
+              return;
+            }
+
+            const headers = {
+              "X-GitHub-Api-Version": "2026-03-10"
+            };
+
+            // Fetch the current issue state.
+            const { data: issue } = await github.request(
+              "GET /repos/{owner}/{repo}/issues/{issue_number}",
+              {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                headers
+              }
+            );
+
+            const issueType =
+              typeof issue.type === "string"
+                ? issue.type
+                : issue.type?.name;
+
+            if (!["Feature", "Bug"].includes(issueType)) {
+              core.info(
+                `Ignoring issue type: ${issueType ?? "none"}`
+              );
+              return;
+            }
+
+            /*
+             * Initialize Ready for Refinement.
+             *
+             * Only runs when the issue is opened or given a type.
+             * Existing values, including YES, are never overwritten.
+             */
+            if (["opened", "typed"].includes(action)) {
+              const { data: fieldValues } = await github.request(
+                "GET /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values",
+                {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  per_page: 100,
+                  headers
+                }
+              );
+
+              const alreadySet = fieldValues.some(
+                field =>
+                  Number(field.issue_field_id) === fieldId
+              );
+
+              if (!alreadySet) {
+                await github.request(
+                  "POST /repos/{owner}/{repo}/issues/{issue_number}/issue-field-values",
+                  {
+                    owner,
+                    repo,
+                    issue_number: issueNumber,
+                    issue_field_values: [
+                      {
+                        field_id: fieldId,
+                        value: "NO"
+                      }
+                    ],
+                    headers
+                  }
+                );
+
+                core.info(
+                  "Ready for Refinement initialized to NO."
+                );
+              } else {
+                core.info(
+                  "Ready for Refinement already has a value."
+                );
+              }
+            }
+
+            /*
+             * Detect at least one non-empty checkbox immediately
+             * beneath the Acceptance Criteria heading.
+             *
+             * Matches:
+             *
+             * ### Acceptance Criteria
+             *
+             * - [ ] Some criterion
+             */
+            const body = issue.body ?? "";
+
+            const hasAcceptanceCriteria =
+              /(?:^|\n)###[ \t]+Acceptance Criteria[ \t]*\r?\n(?:[ \t]*\r?\n)*[ \t]*-[ \t]*\[[ xX]\][ \t]+\S/i.test(
+                body
+              );
+
+            if (!hasAcceptanceCriteria) {
+              core.info(
+                "No non-empty Acceptance Criteria provided."
+              );
+              return;
+            }
+
+            /*
+             * Notify QA once.
+             *
+             * The hidden marker prevents duplicate comments.
+             */
+            const marker =
+              "<!-- qa-acceptance-criteria-review-request -->";
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              {
+                owner,
+                repo,
+                issue_number: issueNumber,
+                per_page: 100
+              }
+            );
+
+            const alreadyNotified = comments.some(
+              comment => comment.body?.includes(marker)
+            );
+
+            if (alreadyNotified) {
+              core.info("QA has already been notified.");
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body: [
+                marker,
+                `${process.env.QA_MENTION} please review the AC and change the \`Ready for Refinement\` field to \`YES\` if you are satisfied with the AC. If you want changes, please make the \`Ready for Refinement\` field \`NO\` and tag the devs in Slack in a dedicated thread for this ticket to discuss the changes you want.`
+              ].join("\n")
+            });
+
+            core.info("QA review comment added.");

@@ -1,0 +1,54 @@
+name: Bug
+description: Report unexpected behavior
+type: Bug
+
+body:
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-criteria
+    attributes:
+      label: Expected Criteria
+      description: What should happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-criteria
+    attributes:
+      label: Actual Criteria
+      description: What actually happens?
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Optional additional context.
+    validations:
+      required: false
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Optional acceptance and regression criteria.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+
+        ### Regression
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: false
