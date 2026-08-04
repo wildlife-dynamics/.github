@@ -23,7 +23,23 @@ Usage and caller examples are documented at the top of each workflow.
 ## Contributing
 
 - Reusable workflow names should start with `_`.
-- After installing `pre-commit`, enable the local checks with
-  `pre-commit install`.
-- Run all local checks manually with `pre-commit run --all-files`.
 - Update a workflow's usage comments whenever its inputs or behavior change.
+
+### Local checks
+
+Install [`prek`](https://prek.j178.dev/installation/), then install this
+repository's Git hooks:
+
+```sh
+prek install
+```
+
+The checks run automatically before every commit and push. They validate GitHub
+Actions workflows with `actionlint`, issue forms with `check-jsonschema`, and
+workflow security with `zizmor`.
+
+Run every check manually with:
+
+```sh
+prek run --all-files
+```
