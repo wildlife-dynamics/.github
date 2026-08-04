@@ -22,6 +22,8 @@ Usage and caller examples are documented at the top of each workflow.
 
 ## Contributing
 
-Keep reusable workflows backward compatible where possible. Validate workflow
+- Reusable workflow names should start with `_`.
+- Validate workflow
 changes with `actionlint` and update the workflow's usage comments whenever its
 inputs or behavior change.
+
