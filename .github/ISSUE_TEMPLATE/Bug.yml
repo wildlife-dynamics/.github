@@ -31,14 +31,6 @@ body:
       required: true
 
   - type: textarea
-    id: notes
-    attributes:
-      label: Notes
-      description: Optional additional context.
-    validations:
-      required: false
-
-  - type: textarea
     id: acceptance-criteria
     attributes:
       label: Acceptance Criteria
@@ -50,5 +42,13 @@ body:
         ### Regression
         - [ ] ...
         - [ ] ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Optional additional context.
     validations:
       required: false
