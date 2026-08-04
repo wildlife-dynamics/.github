@@ -19,7 +19,7 @@
 #   issues: read
 #
 # jobs:
-#   check-linked-issue:
+#   check-pull-request-for-linked-issue:
 #     uses: wildlife-dynamics/.github/.github/workflows/_check-pull-requests-mention-linked-issue.yml@main
 #     with:
 #       pr_body: ${{ github.event.pull_request.body }}
@@ -40,7 +40,7 @@ on:
         default: 30
 
 jobs:
-  check-linked-issue:
+  check-pull-request-for-linked-issue:
     if: github.event.pull_request.user.login != 'ecoscope-elebot' && github.event.pull_request.user.login != 'dependabot'
     runs-on: ubuntu-latest
     permissions:
