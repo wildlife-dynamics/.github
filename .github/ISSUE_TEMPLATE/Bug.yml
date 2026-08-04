@@ -15,17 +15,17 @@ body:
       required: true
 
   - type: textarea
-    id: expected-criteria
+    id: expected-results
     attributes:
-      label: Expected Criteria
+      label: Expected Results
       description: What should happen?
     validations:
       required: true
 
   - type: textarea
-    id: actual-criteria
+    id: actual-results
     attributes:
-      label: Actual Criteria
+      label: Actual Results
       description: What actually happens?
     validations:
       required: true
