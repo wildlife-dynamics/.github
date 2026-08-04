@@ -16,9 +16,9 @@
 #
 # jobs:
 #   initialize-refinement:
-#     uses: wildlife-dynamics/.github/.github/workflows/_initialize-ready-for-refinement-on-features-bugs.yml@main
+#     uses: wildlife-dynamics/.github/.github/workflows/_initialize-refinement-and-request-qa-review-for-features-and-bugs.yml@main
 
-name: Initialize Ready for Refinement field to NO on Features and Bugs
+name: Initialize refinement and request QA review for Features and Bugs
 
 on:
   workflow_call:
@@ -31,7 +31,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  initialize:
+  initialize-refinement-and-request-qa-review:
     runs-on: ubuntu-latest
 
     steps:

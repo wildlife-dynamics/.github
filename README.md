@@ -15,7 +15,7 @@ that can be called from other repositories.
 
 - `.github/workflows/_check-pull-requests-mention-linked-issue.yml` checks that a
   pull request links to a sufficiently detailed issue.
-- `.github/workflows/_initialize-ready-for-refinement-on-features-bugs.yml`
+- `.github/workflows/_initialize-refinement-and-request-qa-review-for-features-and-bugs.yml`
   initializes refinement status and requests QA review.
 
 Usage and caller examples are documented at the top of each workflow.
