@@ -1,3 +1,23 @@
+# Handles issues with the `Feature` or `Bug` type. When an issue is opened or
+# assigned a type, initializes its `Ready for Refinement` field to `NO` without
+# overwriting an existing value. When acceptance criteria are present, posts a
+# one-time request for QA review.
+#
+# Example caller:
+#
+# name: Initialize issue refinement
+#
+# on:
+#   issues:
+#     types: [opened, edited, typed]
+#
+# permissions:
+#   issues: write
+#
+# jobs:
+#   initialize-refinement:
+#     uses: wildlife-dynamics/.github/.github/workflows/_initialize-ready-for-refinement-on-features-bugs.yml@main
+
 name: Initialize Ready for Refinement field to NO on Features and Bugs
 
 on:

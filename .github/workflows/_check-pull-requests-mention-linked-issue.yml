@@ -1,3 +1,30 @@
+# Verifies that a pull request links to an issue in the same repository and that
+# the linked issue has a sufficiently detailed description. Pull requests from
+# `ecoscope-elebot` and `dependabot` are skipped.
+#
+# Inputs:
+#   `pr_body` (required, string): Pull request body to inspect.
+#   `min_issue_description_length` (optional, number): Minimum linked issue
+#     description length. Defaults to `30`.
+#
+# Example caller:
+#
+# name: Check linked issue
+#
+# on:
+#   pull_request:
+#     types: [opened, edited, reopened, synchronize]
+#
+# permissions:
+#   issues: read
+#
+# jobs:
+#   check-linked-issue:
+#     uses: wildlife-dynamics/.github/.github/workflows/_check-pull-requests-mention-linked-issue.yml@main
+#     with:
+#       pr_body: ${{ github.event.pull_request.body }}
+#       min_issue_description_length: 30
+
 name: Check PRs mention a linked issue with a sufficient description
 
 on:
