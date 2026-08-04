@@ -1,0 +1,73 @@
+name: Pull request checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pull-request-checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: Validate workflows with actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
+  issue-forms:
+    name: Validate issue forms with check-jsonschema
+    runs-on: ubuntu-latest
+    env:
+      ISSUE_FORMS_SCHEMA: https://json.schemastore.org/github-issue-forms.json
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install check-jsonschema
+        run: python -m pip install "check-jsonschema==0.37.2"
+
+      - name: Validate issue forms
+        run: >-
+          check-jsonschema
+          --schemafile "$ISSUE_FORMS_SCHEMA"
+          .github/ISSUE_TEMPLATE/Bug.yml
+          .github/ISSUE_TEMPLATE/Feature.yml
+
+  zizmor:
+    name: Audit workflows with zizmor
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@v0.6.2
+        with:
+          advanced-security: false
+          annotations: true
+          config: .github/zizmor.yml
+          version: v1.28.0

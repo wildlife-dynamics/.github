@@ -47,7 +47,7 @@ jobs:
       issues: read
     steps:
       - name: Verify Linked Issue has a sufficient description
-        uses: actions/github-script@v6
+        uses: actions/github-script@v9
         env:
           pr_body: ${{ inputs.pr_body }}
           min_issue_description_length: ${{ inputs.min_issue_description_length }}

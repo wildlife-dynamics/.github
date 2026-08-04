@@ -1,4 +1,4 @@
-# Wildlife Dynamics GitHub configuration
+# Ecoscope Shared GitHub configurations
 
 This repository contains shared GitHub configuration for the Wildlife Dynamics
 organization. It provides organization-wide issue forms and reusable workflows
@@ -23,7 +23,23 @@ Usage and caller examples are documented at the top of each workflow.
 ## Contributing
 
 - Reusable workflow names should start with `_`.
-- Validate workflow
-changes with `actionlint` and update the workflow's usage comments whenever its
-inputs or behavior change.
+- Update a workflow's usage comments whenever its inputs or behavior change.
 
+### Local checks
+
+Install [`prek`](https://prek.j178.dev/installation/), then install this
+repository's Git hooks:
+
+```sh
+prek install
+```
+
+The checks run automatically before every commit and push. They validate GitHub
+Actions workflows with `actionlint`, issue forms with `check-jsonschema`, and
+workflow security with `zizmor`.
+
+Run every check manually with:
+
+```sh
+prek run --all-files
+```
