@@ -1,4 +1,4 @@
-# Wildlife Dynamics GitHub configuration
+# Ecoscope Shared GitHub configurations
 
 This repository contains shared GitHub configuration for the Wildlife Dynamics
 organization. It provides organization-wide issue forms and reusable workflows
