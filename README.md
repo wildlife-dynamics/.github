@@ -13,12 +13,30 @@ that can be called from other repositories.
 
 ## Reusable workflows
 
+- `.github/workflows/_automerge-auto-approve-prs.yml` enables squash auto-merge for
+  non-draft pull requests labeled `automerge` and auto-approves matching
+  `ecoscope-elebot` pull requests.
 - `.github/workflows/_check-pull-requests-mention-linked-issue.yml` checks that a
   pull request links to a sufficiently detailed issue.
 - `.github/workflows/_initialize-refinement-and-request-qa-review-for-features-and-bugs.yml`
   initializes refinement status and requests QA review.
 
 Usage and caller examples are documented at the top of each workflow.
+
+### Automerge setup
+
+In each calling repository:
+
+- Enable **Allow auto-merge** and **Allow squash merging** in repository settings.
+- Create the `automerge` label.
+- Provide `ECOSCOPE_ELEBOT_PAT` as an Actions secret, with access to merge pull
+  requests in that repository.
+- Enable **Allow GitHub Actions to create and approve pull requests** for automatic
+  approval of `ecoscope-elebot` pull requests.
+- Grant the calling job `pull-requests: write`, as shown in the workflow example.
+
+GitHub's required approvals, checks, and branch update requirements still apply.
+The reusable workflow must be merged here before callers reference it on `main`.
 
 ## Contributing
 
