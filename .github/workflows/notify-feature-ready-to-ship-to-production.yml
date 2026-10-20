@@ -268,9 +268,9 @@ jobs:
                 issue_number: issueNumber,
                 body: [
                   marker,
-                  `Feature #${issueNumber}: ${issue.title}`,
+                  `**Feature: ${issue.title}**`,
                   "",
-                  `${mentions} This feature is officially Done! 🎉 A feature shipped is a feature earned. Please land it on production ASAP. 🚀`
+                  `${mentions} This feature is officially \`Done\`! 🎉 A feature shipped is a feature earned. Please land it on production ASAP. 🚀`
                 ].join("\n")
               }));
             }
@@ -282,7 +282,7 @@ jobs:
 
             // Build Slack text separately so GitHub keeps GitHub mentions.
             // Escape the title before enabling Slack markup and user mentions.
-            const message = `Feature #${issueNumber}: ${escapeSlack(issue.title)}\n\n${slackMentions} This feature is officially Done! 🎉 A feature shipped is a feature earned. Please land it on production ASAP. 🚀`;
+            const message = `*Feature: ${escapeSlack(issue.title)}*\n\n${slackMentions} This feature is officially \`Done\`! 🎉 A feature shipped is a feature earned. Please land it on production ASAP. 🚀`;
             const commentUrl = comment.html_url;
             const response = await fetch(webhookUrl, {
               method: "POST",

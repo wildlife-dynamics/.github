@@ -51,7 +51,7 @@ Configure the `.github` Actions repository variable `GH_USERNAME_TO_SLACK_MEMBER
 with a JSON mapping, for example `{"enlivn":"U0123456789"}`. Mapped owners receive
 Slack mentions; unmapped owners appear as plain GitHub usernames. External owners
 must belong to the destination Slack Connect channel. GitHub comments retain
-GitHub mentions. Both messages include the feature number and title.
+GitHub mentions. Both messages include a bold feature title.
 
 All assignees are mentioned in one comment. A hidden marker prevents duplicate
 comments; another records successful Slack delivery. If Slack fails, rerun the
