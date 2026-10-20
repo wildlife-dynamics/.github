@@ -20,8 +20,33 @@ that can be called from other repositories.
   pull request links to a sufficiently detailed issue.
 - `.github/workflows/_initialize-refinement-and-request-qa-review-for-features-and-bugs.yml`
   initializes refinement status and requests QA review.
+- `.github/workflows/_notify-feature-ready-to-ship-to-production.yml` notifies a
+  closed Feature issue's assignees if its project Status is Done.
 
 Usage and caller examples are documented at the top of each workflow.
+
+### Feature completion notifications
+
+Add the example caller at the top of the workflow to each repository that
+should send notifications. It runs when an issue closes, then checks that the
+issue is a **Feature**, is closed as **completed**, has an assignee, and has
+**Status = Done** in
+[organization project 2](https://github.com/orgs/wildlife-dynamics/projects/2).
+The project number is configurable through the `project_number` input.
+
+Pass `PROJECTS_READ_TOKEN` with read access to both the organization project and
+the repository's issues. For a classic personal access token, this requires
+`read:project` and access to the repository (`repo` for private repositories).
+The token's account must also have access to the project. Project reads use
+this token; issue comments use the caller's `GITHUB_TOKEN` with `issues: write`.
+
+All current GitHub assignees are mentioned in one comment, once per issue,
+including after retries or reopening and completing the feature again. Issues
+closed as not planned, reopened issues, non-Feature issues, unassigned features,
+and features outside Done are ignored. Changing project status after the
+closure run has finished does not trigger another check.
+
+The reusable workflow must be merged here before callers reference it on `main`.
 
 ### Automerge setup
 

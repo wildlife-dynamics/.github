@@ -1,0 +1,217 @@
+# Notifies a closed Feature issue's assignees if its project Status is Done.
+# A hidden marker prevents duplicate comments after retries or repeated closure.
+#
+# Inputs:
+#   `project_number` (optional, number): Organization project number. Default: 2.
+# Secrets:
+#   `PROJECTS_READ_TOKEN` (required): Token with read access to the project and
+#     the calling repository's issues. Comments use the caller's GITHUB_TOKEN.
+#
+# Example caller:
+#
+# name: Notify feature owners
+#
+# on:
+#   issues:
+#     types: [closed]
+#
+# permissions:
+#   issues: write
+#
+# jobs:
+#   notify:
+#     uses: wildlife-dynamics/.github/.github/workflows/_notify-feature-ready-to-ship-to-production.yml@main
+#     with:
+#       project_number: 2
+#     secrets:
+#       PROJECTS_READ_TOKEN: ${{ secrets.ECOSCOPE_ELEBOT_PAT }}
+
+name: Notify feature owners when ready to ship to production
+
+on:
+  workflow_call:
+    inputs:
+      project_number:
+        description: Organization project whose Status must be Done
+        required: false
+        type: number
+        default: 2
+    secrets:
+      PROJECTS_READ_TOKEN:
+        description: Token with read access to the project and repository issues
+        required: true
+
+permissions:
+  issues: write
+
+concurrency:
+  group: notify-feature-ready-to-ship-${{ github.repository }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  notify-feature-ready-to-ship:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check feature and project status
+        id: eligibility
+        uses: actions/github-script@v9
+        env:
+          PROJECT_NUMBER: ${{ inputs.project_number }}
+        with:
+          github-token: ${{ secrets.PROJECTS_READ_TOKEN }}
+          script: |
+            if (
+              context.eventName !== "issues" ||
+              context.payload.action !== "closed" ||
+              context.payload.issue?.pull_request
+            ) {
+              core.info("Ignoring event: not an issue closure.");
+              return false;
+            }
+
+            const { owner, repo } = context.repo;
+            const issueNumber = context.issue.number;
+            const { data: issue } = await github.rest.issues.get({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              headers: { "X-GitHub-Api-Version": "2026-03-10" }
+            });
+            const issueType =
+              typeof issue.type === "string" ? issue.type : issue.type?.name;
+            const assignees = issue.assignees ?? [];
+
+            if (
+              issue.pull_request ||
+              issue.state !== "closed" ||
+              issue.state_reason !== "completed" ||
+              issueType !== "Feature" ||
+              assignees.length === 0
+            ) {
+              core.info("Ignoring issue: not a completed Feature with an owner.");
+              return false;
+            }
+
+            const projectNumber = Number(process.env.PROJECT_NUMBER);
+
+            if (!Number.isInteger(projectNumber) || projectNumber <= 0) {
+              core.setFailed("project_number must be a positive integer.");
+              return false;
+            }
+
+            let cursor = null;
+
+            // Check only this organization's configured project. Other
+            // projects may also contain this issue with their own Status.
+            do {
+              const { organization, repository } = await github.graphql(
+                `query($owner: String!, $repo: String!, $issue: Int!, $project: Int!, $cursor: String) {
+                  organization(login: $owner) {
+                    projectV2(number: $project) { id }
+                  }
+                  repository(owner: $owner, name: $repo) {
+                    issue(number: $issue) {
+                      projectItems(first: 100, after: $cursor, includeArchived: false) {
+                        nodes {
+                          project { id }
+                          fieldValueByName(name: "Status") {
+                            ... on ProjectV2ItemFieldSingleSelectValue { name }
+                          }
+                        }
+                        pageInfo { hasNextPage endCursor }
+                      }
+                    }
+                  }
+                }`,
+                {
+                  owner,
+                  repo,
+                  issue: issueNumber,
+                  project: projectNumber,
+                  cursor
+                }
+              );
+
+              const projectId = organization?.projectV2?.id;
+              const items = repository?.issue?.projectItems;
+
+              if (!projectId || !items) {
+                core.setFailed("Cannot read the configured project or issue. Check PROJECTS_READ_TOKEN access.");
+                return false;
+              }
+
+              const item = items.nodes.find(item => item.project.id === projectId);
+
+              if (item) {
+                const isDone = item.fieldValueByName?.name === "Done";
+                core.info(isDone ? "Feature is Done." : "Feature is not Done.");
+                return isDone;
+              }
+
+              cursor = items.pageInfo.hasNextPage ? items.pageInfo.endCursor : null;
+            } while (cursor);
+
+            core.info("Ignoring issue: not in the configured project.");
+            return false;
+
+      - name: Notify feature owners
+        if: steps.eligibility.outputs.result == 'true'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issueNumber = context.issue.number;
+
+            // Recheck current ownership and closure before posting. Comments
+            // use GITHUB_TOKEN, keeping PROJECTS_READ_TOKEN read-only.
+            const { data: issue } = await github.rest.issues.get({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              headers: { "X-GitHub-Api-Version": "2026-03-10" }
+            });
+            const issueType =
+              typeof issue.type === "string" ? issue.type : issue.type?.name;
+            const assignees = issue.assignees ?? [];
+
+            if (
+              issue.pull_request ||
+              issue.state !== "closed" ||
+              issue.state_reason !== "completed" ||
+              issueType !== "Feature" ||
+              assignees.length === 0
+            ) {
+              core.info("Ignoring issue: no longer a completed Feature with an owner.");
+              return;
+            }
+
+            const marker = "<!-- feature-ready-to-ship-to-production -->";
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number: issueNumber, per_page: 100 }
+            );
+            const alreadyNotified = comments.some(
+              comment =>
+                comment.user?.login === "github-actions[bot]" &&
+                comment.body?.includes(marker)
+            );
+
+            if (alreadyNotified) {
+              core.info("Feature owners have already been notified.");
+              return;
+            }
+
+            const mentions = assignees.map(assignee => `@${assignee.login}`).join(" ");
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body: [
+                marker,
+                `${mentions} This feature is officially Done! 🎉 A feature shipped is a feature earned. Please land it on production ASAP. 🚀`
+              ].join("\n")
+            });
+
+            core.info("Feature owners notified that the feature is ready to ship.");
