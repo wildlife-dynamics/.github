@@ -1,4 +1,6 @@
 name: Pull request checks
+run-name: >-
+  ${{ inputs.notify_feature && format('Feature shipment notification for {0}#{1}', inputs.repository, inputs.issue_number) || '' }}
 
 on:
   pull_request:
@@ -7,38 +9,53 @@ on:
       - main
   workflow_dispatch:
     inputs:
-      test_slack:
-        description: Send a Slack integration-test message
+      notify_feature:
+        description: Run the complete feature notification flow in .github
         required: false
         type: boolean
         default: false
-      message:
-        description: Slack message for a manual integration test
-        required: false
-        type: string
-        default: Slack integration test
-      comment_url:
-        description: Optional feature reminder comment for the Slack test
+      repository:
+        description: Source repository, for example wildlife-dynamics/compose
         required: false
         type: string
         default: ""
+      issue_number:
+        description: Feature issue number in the source repository
+        required: false
+        type: string
+        default: ""
+      project_number:
+        description: Organization project whose Status must be Done
+        required: false
+        type: string
+        default: "2"
+      fail_if_ineligible:
+        description: Fail the manual test if the selected issue is not eligible
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: pull-request-checks-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: >-
+    pull-request-checks-${{ github.workflow }}-${{ inputs.notify_feature && format('{0}-{1}', inputs.repository, inputs.issue_number) || github.ref }}
+  cancel-in-progress: ${{ !inputs.notify_feature }}
 
 jobs:
-  slack-test:
-    if: github.event_name == 'workflow_dispatch' && inputs.test_slack
+  notify-feature:
+    if: github.event_name == 'workflow_dispatch' && inputs.notify_feature
     permissions: {}
-    uses: ./.github/workflows/notify-slack-feature-ready-to-ship.yml
+    uses: ./.github/workflows/notify-feature-ready-to-ship-to-production.yml
     with:
-      message: ${{ inputs.message }}
-      comment_url: ${{ inputs.comment_url }}
+      repository: ${{ inputs.repository }}
+      issue_number: ${{ inputs.issue_number }}
+      project_number: ${{ inputs.project_number }}
+      fail_if_ineligible: ${{ inputs.fail_if_ineligible }}
     secrets:
+      ECOSCOPE_ELEBOT_PAT: ${{ secrets.ECOSCOPE_ELEBOT_PAT }}
+      RAY_TEMPORARY_PAT_TOKEN_WHILE_ELEBOT_GETS_PROJECT_READ_ACCESS: ${{ secrets.RAY_TEMPORARY_PAT_TOKEN_WHILE_ELEBOT_GETS_PROJECT_READ_ACCESS }}
       FEATURE_READY_SLACK_WEBHOOK_URL: ${{ secrets.FEATURE_READY_SLACK_WEBHOOK_URL }}
 
   actionlint:

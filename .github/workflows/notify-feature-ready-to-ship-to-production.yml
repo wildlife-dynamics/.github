@@ -1,0 +1,293 @@
+# Runs in .github and reads this repository's PAT and Slack webhook secrets.
+# The personal PAT only reads projects; the elebot PAT posts issue comments.
+name: Notify feature owners that Feature is ready to ship
+run-name: >-
+  Feature shipment notification for ${{ inputs.repository }}#${{ inputs.issue_number }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Source repository, for example wildlife-dynamics/compose
+        required: true
+        type: string
+      issue_number:
+        description: Feature issue number in the source repository
+        required: true
+        type: string
+      project_number:
+        description: Organization project whose Status must be Done
+        required: false
+        type: string
+        default: "2"
+      fail_if_ineligible:
+        description: Fail a manual test if the selected issue is not eligible
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      repository:
+        required: true
+        type: string
+      issue_number:
+        required: true
+        type: string
+      project_number:
+        required: false
+        type: string
+        default: "2"
+      fail_if_ineligible:
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      ECOSCOPE_ELEBOT_PAT:
+        required: true
+      RAY_TEMPORARY_PAT_TOKEN_WHILE_ELEBOT_GETS_PROJECT_READ_ACCESS:
+        required: true
+      FEATURE_READY_SLACK_WEBHOOK_URL:
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: central-feature-ready-${{ inputs.repository }}-${{ inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  notify-feature-ready-to-ship:
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_REPOSITORY: ${{ inputs.repository }}
+      FEATURE_ISSUE_NUMBER: ${{ inputs.issue_number }}
+      PROJECT_NUMBER: ${{ inputs.project_number }}
+      FAIL_IF_INELIGIBLE: ${{ inputs.fail_if_ineligible }}
+    steps:
+      - name: Check feature and comment identity
+        id: issue
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.ECOSCOPE_ELEBOT_PAT }}
+          script: |
+            const failIfIneligible = process.env.FAIL_IF_INELIGIBLE === "true";
+            const [owner, repo, extra] = process.env.SOURCE_REPOSITORY.split("/");
+            const issueNumber = Number(process.env.FEATURE_ISSUE_NUMBER);
+
+            if (
+              context.repo.repo !== ".github" ||
+              owner?.toLowerCase() !== context.repo.owner.toLowerCase() ||
+              !/^[A-Za-z0-9_.-]+$/.test(repo ?? "") ||
+              extra !== undefined ||
+              !Number.isSafeInteger(issueNumber) || issueNumber <= 0
+            ) {
+              core.setFailed("Run this workflow in .github with an organization repository and a positive issue_number.");
+              return false;
+            }
+
+            const { data: actor } = await github.rest.users.getAuthenticated();
+            if (actor.login.toLowerCase() !== "ecoscope-elebot") {
+              core.setFailed("ECOSCOPE_ELEBOT_PAT must authenticate as ecoscope-elebot.");
+              return false;
+            }
+            core.info(`Checking ${owner}/${repo}#${issueNumber} as @${actor.login}.`);
+
+            const { data: issue } = await github.rest.issues.get({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              headers: { "X-GitHub-Api-Version": "2026-03-10" }
+            });
+            const issueType =
+              typeof issue.type === "string" ? issue.type : issue.type?.name;
+            const assignees = issue.assignees ?? [];
+
+            if (
+              issue.pull_request ||
+              issue.state !== "closed" ||
+              issue.state_reason !== "completed" ||
+              issueType !== "Feature" ||
+              assignees.length === 0
+            ) {
+              core.info("Ignoring issue: not a completed Feature with an owner.");
+              if (failIfIneligible) core.setFailed("The selected issue must be a closed, completed Feature with an assignee.");
+              return false;
+            }
+            return true;
+
+      - name: Check project status
+        id: project
+        if: steps.issue.outputs.result == 'true'
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.RAY_TEMPORARY_PAT_TOKEN_WHILE_ELEBOT_GETS_PROJECT_READ_ACCESS }}
+          script: |
+            const failIfIneligible = process.env.FAIL_IF_INELIGIBLE === "true";
+            const [owner, repo] = process.env.SOURCE_REPOSITORY.split("/");
+            const issueNumber = Number(process.env.FEATURE_ISSUE_NUMBER);
+            const { data: actor } = await github.rest.users.getAuthenticated();
+            core.info(`Reading Project ${process.env.PROJECT_NUMBER} as @${actor.login}.`);
+            const projectNumber = Number(process.env.PROJECT_NUMBER);
+
+            if (!Number.isInteger(projectNumber) || projectNumber <= 0) {
+              core.setFailed("project_number must be a positive integer.");
+              return false;
+            }
+
+            let cursor = null;
+
+            // Check only this organization's configured project. Other
+            // projects may also contain this issue with their own Status.
+            do {
+              const { organization, repository } = await github.graphql(
+                `query($owner: String!, $repo: String!, $issue: Int!, $project: Int!, $cursor: String) {
+                  organization(login: $owner) {
+                    projectV2(number: $project) { id }
+                  }
+                  repository(owner: $owner, name: $repo) {
+                    issue(number: $issue) {
+                      projectItems(first: 100, after: $cursor, includeArchived: false) {
+                        nodes {
+                          project { id }
+                          fieldValueByName(name: "Status") {
+                            ... on ProjectV2ItemFieldSingleSelectValue { name }
+                          }
+                        }
+                        pageInfo { hasNextPage endCursor }
+                      }
+                    }
+                  }
+                }`,
+                {
+                  owner,
+                  repo,
+                  issue: issueNumber,
+                  project: projectNumber,
+                  cursor
+                }
+              );
+
+              const projectId = organization?.projectV2?.id;
+              const items = repository?.issue?.projectItems;
+
+              if (!projectId || !items) {
+                core.setFailed("Cannot read the configured project or issue. Check the central PAT account and project access.");
+                return false;
+              }
+
+              const item = items.nodes.find(item => item.project.id === projectId);
+
+              if (item) {
+                const isDone = item.fieldValueByName?.name === "Done";
+                core.info(isDone ? "Feature is Done." : "Feature is not Done.");
+                if (failIfIneligible && !isDone) core.setFailed("The selected Feature is not Done in the configured project.");
+                return isDone;
+              }
+
+              cursor = items.pageInfo.hasNextPage ? items.pageInfo.endCursor : null;
+            } while (cursor);
+
+            core.info("Ignoring issue: not in the configured project.");
+            if (failIfIneligible) core.setFailed("The selected Feature is not in the configured project.");
+            return false;
+
+      - name: Notify feature owners in GitHub and Slack
+        if: steps.project.outputs.result == 'true'
+        uses: actions/github-script@v9
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.FEATURE_READY_SLACK_WEBHOOK_URL }}
+        with:
+          github-token: ${{ secrets.ECOSCOPE_ELEBOT_PAT }}
+          script: |
+            const [owner, repo] = process.env.SOURCE_REPOSITORY.split("/");
+            const issueNumber = Number(process.env.FEATURE_ISSUE_NUMBER);
+            const webhookUrl = process.env.SLACK_WEBHOOK_URL;
+
+            if (!webhookUrl) {
+              core.setFailed("Configure FEATURE_READY_SLACK_WEBHOOK_URL in .github's Actions secrets.");
+              return;
+            }
+
+            // Recheck ownership and closure before posting. The elebot PAT writes
+            // to the source repository; .github's GITHUB_TOKEN cannot do that.
+            const { data: issue } = await github.rest.issues.get({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              headers: { "X-GitHub-Api-Version": "2026-03-10" }
+            });
+            const issueType = typeof issue.type === "string" ? issue.type : issue.type?.name;
+            const assignees = issue.assignees ?? [];
+
+            if (
+              issue.pull_request ||
+              issue.state !== "closed" ||
+              issue.state_reason !== "completed" ||
+              issueType !== "Feature" ||
+              assignees.length === 0
+            ) {
+              core.info("Ignoring issue: no longer a completed Feature with an owner.");
+              return;
+            }
+
+            const marker = "<!-- feature-ready-to-ship-to-production -->";
+            const sentMarker = "<!-- feature-ready-slack-sent -->";
+            const legacyDispatchMarker = "<!-- feature-ready-slack-dispatched -->";
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: issueNumber, per_page: 100
+            });
+            let comment = comments.find(candidate =>
+              ["ecoscope-elebot", "github-actions[bot]"].includes(candidate.user?.login) &&
+              candidate.body?.startsWith(marker)
+            );
+
+            if (!comment) {
+              const mentions = assignees.map(assignee => `@${assignee.login}`).join(" ");
+              ({ data: comment } = await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                body: [
+                  marker,
+                  `${mentions} This feature is officially Done! 🎉 A feature shipped is a feature earned. Please land it on production ASAP. 🚀`
+                ].join("\n")
+              }));
+            }
+
+            if (comment.body.includes(sentMarker) || comment.body.includes(legacyDispatchMarker)) {
+              core.info("This feature reminder was already sent or dispatched to Slack.");
+              return;
+            }
+
+            const message = comment.body.replace(marker, "").trim();
+            const commentUrl = comment.html_url;
+            const response = await fetch(webhookUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                text: `${message}\n${commentUrl}`,
+                blocks: [
+                  { type: "section", text: { type: "plain_text", text: message } },
+                  {
+                    type: "context",
+                    elements: [{ type: "mrkdwn", text: `<${commentUrl}|View GitHub comment>` }]
+                  }
+                ]
+              }),
+              signal: AbortSignal.timeout(15000)
+            });
+
+            if (!response.ok) {
+              core.setFailed(`GitHub comment exists, but Slack failed (HTTP ${response.status}). Rerun this central job to retry Slack.`);
+              return;
+            }
+
+            // Mark delivery only after Slack accepts the message. Failed Slack requests
+            // can be retried without posting another issue comment.
+            await github.rest.issues.updateComment({
+              owner,
+              repo,
+              comment_id: comment.id,
+              body: `${comment.body}\n${sentMarker}`
+            });
+            core.info(`Feature owners notified: ${commentUrl}`);

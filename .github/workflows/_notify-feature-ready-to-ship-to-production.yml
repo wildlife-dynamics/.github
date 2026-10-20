@@ -1,36 +1,30 @@
-# Notifies a closed Feature issue's assignees if its project Status is Done.
-# A hidden marker prevents duplicate comments after retries or repeated closure.
-# Dispatches a separate workflow in .github to post the reminder to Slack.
+# Dispatches feature notifications to a separate run in .github.
+# Project reads, issue comments, and Slack delivery use .github's own secrets.
 #
 # Inputs:
 #   `project_number` (optional, number): Organization project number. Default: 2.
 #   `issue_number` (optional, number): Issue for a manual full-flow test.
-#   `slack_workflow_ref` (optional, string): Slack workflow branch. Default: main.
+#   `notification_workflow_ref` (optional, string): Central workflow branch.
 # Secrets:
-#   `PROJECTS_READ_TOKEN` (required): Token with read access to the project and
-#     the calling repository's issues, and Actions write access to .github.
-#     Comments use the caller's GITHUB_TOKEN.
+#   `DISPATCH_TOKEN` (required): Token with Actions write access to .github.
+#     No project permission is needed by the calling repository.
 #
 # Example caller:
 #
-# name: Notify feature owners
-#
+# name: Notify feature owners that Feature is ready to ship
 # on:
 #   issues:
 #     types: [closed]
-#
-# permissions:
-#   issues: write
-#
+# permissions: {}
 # jobs:
 #   notify:
 #     uses: wildlife-dynamics/.github/.github/workflows/_notify-feature-ready-to-ship-to-production.yml@main
 #     with:
 #       project_number: 2
 #     secrets:
-#       PROJECTS_READ_TOKEN: ${{ secrets.ECOSCOPE_ELEBOT_PAT }}
+#       DISPATCH_TOKEN: ${{ secrets.ECOSCOPE_ELEBOT_PAT }}
 
-name: Notify feature owners when ready to ship to production
+name: Request feature shipment notification
 
 on:
   workflow_call:
@@ -45,253 +39,70 @@ on:
         required: false
         type: number
         default: 0
-      slack_workflow_ref:
-        description: Branch of the central Slack workflow to run
+      notification_workflow_ref:
+        description: Branch of the central notification workflow to run
         required: false
         type: string
         default: main
     secrets:
-      PROJECTS_READ_TOKEN:
-        description: Token with project and issue read access, and Actions write access to .github
+      DISPATCH_TOKEN:
+        description: Token with Actions write access to .github
         required: true
 
-permissions:
-  issues: write
-
-concurrency:
-  group: notify-feature-ready-to-ship-${{ github.repository }}-${{ inputs.issue_number || github.event.issue.number }}
-  cancel-in-progress: false
+permissions: {}
 
 jobs:
-  notify-feature-ready-to-ship:
+  dispatch-feature-notification:
     runs-on: ubuntu-latest
-    env:
-      FEATURE_ISSUE_NUMBER: ${{ inputs.issue_number }}
-      SLACK_WORKFLOW_REF: ${{ inputs.slack_workflow_ref }}
-
     steps:
-      - name: Check feature and project status
-        id: eligibility
+      - name: Start notification workflow in .github
         uses: actions/github-script@v9
         env:
+          FEATURE_ISSUE_NUMBER: ${{ inputs.issue_number }}
           PROJECT_NUMBER: ${{ inputs.project_number }}
+          NOTIFICATION_WORKFLOW_REF: ${{ inputs.notification_workflow_ref }}
         with:
-          github-token: ${{ secrets.PROJECTS_READ_TOKEN }}
+          github-token: ${{ secrets.DISPATCH_TOKEN }}
           script: |
             const manualTest = context.eventName === "workflow_dispatch";
-            const requestedIssue = Number(process.env.FEATURE_ISSUE_NUMBER);
-
-            if (manualTest && (!Number.isSafeInteger(requestedIssue) || requestedIssue <= 0)) {
-              core.setFailed("A manual feature test requires a positive issue_number.");
-              return false;
-            }
-
-            if (
-              !manualTest && (
-                context.eventName !== "issues" ||
-                context.payload.action !== "closed" ||
-                context.payload.issue?.pull_request
-              )
-            ) {
+            if (!manualTest && (
+              context.eventName !== "issues" ||
+              context.payload.action !== "closed" ||
+              context.payload.issue?.pull_request
+            )) {
               core.info("Ignoring event: not an issue closure.");
-              return false;
+              return;
             }
 
-            const { owner, repo } = context.repo;
-            const issueNumber = manualTest ? requestedIssue : context.issue.number;
-            const { data: issue } = await github.rest.issues.get({
-              owner,
-              repo,
-              issue_number: issueNumber,
-              headers: { "X-GitHub-Api-Version": "2026-03-10" }
-            });
-            const issueType =
-              typeof issue.type === "string" ? issue.type : issue.type?.name;
-            const assignees = issue.assignees ?? [];
-
-            if (
-              issue.pull_request ||
-              issue.state !== "closed" ||
-              issue.state_reason !== "completed" ||
-              issueType !== "Feature" ||
-              assignees.length === 0
-            ) {
-              core.info("Ignoring issue: not a completed Feature with an owner.");
-              if (manualTest) core.setFailed("The selected issue must be a closed, completed Feature with an assignee.");
-              return false;
-            }
-
+            const issueNumber = manualTest
+              ? Number(process.env.FEATURE_ISSUE_NUMBER)
+              : context.issue.number;
             const projectNumber = Number(process.env.PROJECT_NUMBER);
-
-            if (!Number.isInteger(projectNumber) || projectNumber <= 0) {
-              core.setFailed("project_number must be a positive integer.");
-              return false;
-            }
-
-            let cursor = null;
-
-            // Check only this organization's configured project. Other
-            // projects may also contain this issue with their own Status.
-            do {
-              const { organization, repository } = await github.graphql(
-                `query($owner: String!, $repo: String!, $issue: Int!, $project: Int!, $cursor: String) {
-                  organization(login: $owner) {
-                    projectV2(number: $project) { id }
-                  }
-                  repository(owner: $owner, name: $repo) {
-                    issue(number: $issue) {
-                      projectItems(first: 100, after: $cursor, includeArchived: false) {
-                        nodes {
-                          project { id }
-                          fieldValueByName(name: "Status") {
-                            ... on ProjectV2ItemFieldSingleSelectValue { name }
-                          }
-                        }
-                        pageInfo { hasNextPage endCursor }
-                      }
-                    }
-                  }
-                }`,
-                {
-                  owner,
-                  repo,
-                  issue: issueNumber,
-                  project: projectNumber,
-                  cursor
-                }
-              );
-
-              const projectId = organization?.projectV2?.id;
-              const items = repository?.issue?.projectItems;
-
-              if (!projectId || !items) {
-                core.setFailed("Cannot read the configured project or issue. Check PROJECTS_READ_TOKEN access.");
-                return false;
-              }
-
-              const item = items.nodes.find(item => item.project.id === projectId);
-
-              if (item) {
-                const isDone = item.fieldValueByName?.name === "Done";
-                core.info(isDone ? "Feature is Done." : "Feature is not Done.");
-                if (manualTest && !isDone) core.setFailed("The selected Feature is not Done in the configured project.");
-                return isDone;
-              }
-
-              cursor = items.pageInfo.hasNextPage ? items.pageInfo.endCursor : null;
-            } while (cursor);
-
-            core.info("Ignoring issue: not in the configured project.");
-            if (manualTest) core.setFailed("The selected Feature is not in the configured project.");
-            return false;
-
-      - name: Notify feature owners
-        if: steps.eligibility.outputs.result == 'true'
-        uses: actions/github-script@v9
-        env:
-          NOTIFICATION_DISPATCH_TOKEN: ${{ secrets.PROJECTS_READ_TOKEN }}
-        with:
-          script: |
-            const { owner, repo } = context.repo;
-            const issueNumber = Number(process.env.FEATURE_ISSUE_NUMBER) || context.issue.number;
-
-            // Recheck current ownership and closure before posting. Comments
-            // use GITHUB_TOKEN; the separate token only reads the project and
-            // starts the Slack workflow in .github.
-            const { data: issue } = await github.rest.issues.get({
-              owner,
-              repo,
-              issue_number: issueNumber,
-              headers: { "X-GitHub-Api-Version": "2026-03-10" }
-            });
-            const issueType =
-              typeof issue.type === "string" ? issue.type : issue.type?.name;
-            const assignees = issue.assignees ?? [];
-
             if (
-              issue.pull_request ||
-              issue.state !== "closed" ||
-              issue.state_reason !== "completed" ||
-              issueType !== "Feature" ||
-              assignees.length === 0
+              !Number.isSafeInteger(issueNumber) || issueNumber <= 0 ||
+              !Number.isSafeInteger(projectNumber) || projectNumber <= 0
             ) {
-              core.info("Ignoring issue: no longer a completed Feature with an owner.");
+              core.setFailed("issue_number and project_number must be positive integers.");
               return;
             }
 
-            const marker = "<!-- feature-ready-to-ship-to-production -->";
-            const comments = await github.paginate(
-              github.rest.issues.listComments,
-              { owner, repo, issue_number: issueNumber, per_page: 100 }
-            );
-            let comment = comments.find(
-              comment =>
-                comment.user?.login === "github-actions[bot]" &&
-                comment.body?.includes(marker)
-            );
-
-            if (!comment) {
-              const mentions = assignees.map(assignee => `@${assignee.login}`).join(" ");
-
-              ({ data: comment } = await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: issueNumber,
-                body: [
-                  marker,
-                  `${mentions} This feature is officially Done! 🎉 A feature shipped is a feature earned. Please land it on production ASAP. 🚀`
-                ].join("\n")
-              }));
-            }
-
-            const dispatchedMarker = "<!-- feature-ready-slack-dispatched -->";
-
-            if (comment.body.includes(dispatchedMarker)) {
-              core.info("Feature owners have already been notified in GitHub and Slack has been dispatched.");
-              return;
-            }
-
-            // A separate run reads .github's own Slack secret. The caller's
-            // GITHUB_TOKEN cannot dispatch workflows in another repository.
-            const workflowRef = process.env.SLACK_WORKFLOW_REF || "main";
-            const preMergeTest = context.eventName === "workflow_dispatch" && workflowRef !== "main";
-            const workflowFile = preMergeTest
-              ? "pull_request_checks.yml"
-              : "notify-slack-feature-ready-to-ship.yml";
-            const response = await fetch(
-              `${process.env.GITHUB_API_URL}/repos/${owner}/.github/actions/workflows/${workflowFile}/dispatches`,
-              {
-                method: "POST",
-                headers: {
-                  Authorization: `Bearer ${process.env.NOTIFICATION_DISPATCH_TOKEN}`,
-                  Accept: "application/vnd.github+json",
-                  "Content-Type": "application/json",
-                  "X-GitHub-Api-Version": "2026-03-10"
-                },
-                body: JSON.stringify({
-                  ref: workflowRef,
-                  inputs: {
-                    message: comment.body.replace(marker, "").trim(),
-                    comment_url: comment.html_url,
-                    ...(preMergeTest ? { test_slack: "true" } : {})
-                  }
-                }),
-                signal: AbortSignal.timeout(15000)
+            const ref = process.env.NOTIFICATION_WORKFLOW_REF || "main";
+            const preMergeTest = ref !== "main";
+            // Before merge, the registered checks workflow calls the new
+            // notification workflow from the same .github branch.
+            const { data } = await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: ".github",
+              workflow_id: preMergeTest
+                ? "pull_request_checks.yml"
+                : "notify-feature-ready-to-ship-to-production.yml",
+              ref,
+              inputs: {
+                repository: `${context.repo.owner}/${context.repo.repo}`,
+                issue_number: String(issueNumber),
+                project_number: String(projectNumber),
+                fail_if_ineligible: String(manualTest),
+                ...(preMergeTest ? { notify_feature: "true" } : {})
               }
-            );
-
-            if (!response.ok) {
-              core.setFailed(`GitHub comment exists, but Slack dispatch failed (HTTP ${response.status}). Check the token's Actions write access to .github, then rerun this job.`);
-              return;
-            }
-
-            // Failed dispatches leave the comment unmarked so a retry can
-            // dispatch Slack without posting another GitHub comment.
-            await github.rest.issues.updateComment({
-              owner,
-              repo,
-              comment_id: comment.id,
-              body: `${comment.body}\n${dispatchedMarker}`
             });
-
-            core.info("Feature owners notified in GitHub; Slack workflow dispatched.");
+            core.info(`Feature notification queued in .github${data?.html_url ? `: ${data.html_url}` : "."}`);

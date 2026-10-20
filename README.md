@@ -27,74 +27,56 @@ Usage and caller examples are documented at the top of each workflow.
 
 ### Feature completion notifications
 
-Add the example caller at the top of the workflow to each repository that
-should send notifications. It runs when an issue closes, then checks that the
-issue is a **Feature**, is closed as **completed**, has an assignee, and has
-**Status = Done** in
-[organization project 2](https://github.com/orgs/wildlife-dynamics/projects/2).
-The project number is configurable through the `project_number` input.
+Each repository's caller runs when an issue closes. The reusable
+`_notify-feature-ready-to-ship-to-production.yml` uses the caller's
+`ECOSCOPE_ELEBOT_PAT`, passed as `DISPATCH_TOKEN`, only to start a separate run
+in this `.github` repository. The caller's token needs write access to `.github`
+and the classic `repo` scope; it does not need project access.
 
-Pass `PROJECTS_READ_TOKEN` with read access to both the organization project and
-the repository's issues. For a classic personal access token, this requires
-`read:project` and access to the repository (`repo` for private repositories).
-The token's account must also have access to the project. Project reads use
-this token; issue comments use the caller's `GITHUB_TOKEN` with `issues: write`.
-The same token also needs permission to dispatch workflows in this `.github`
-repository: the account needs repository write access, and fine-grained tokens
-need **Actions: read and write** here.
+The separate `notify-feature-ready-to-ship-to-production.yml` run checks that
+the source issue is a **Feature**, is closed as **completed**, has an assignee,
+and has **Status = Done** in the configured organization project (default: 2).
+It then comments on the source issue as **ecoscope-elebot** and sends the same
+reminder and comment link to Slack.
 
-All current GitHub assignees are mentioned in one comment, once per issue,
-including after retries or reopening and completing the feature again. Issues
-closed as not planned, reopened issues, non-Feature issues, unassigned features,
-and features outside Done are ignored. Changing project status after the
-closure run has finished does not trigger another check.
+Configure these Actions secrets **in `.github`**:
 
-The reusable workflow must be merged here before callers reference it on `main`.
+| Secret | Purpose and access |
+| --- | --- |
+| `RAY_TEMPORARY_PAT_TOKEN_WHILE_ELEBOT_GETS_PROJECT_READ_ACCESS` | Personal PAT used only for project reads. Classic scopes: `repo` and `read:project`. Its account needs read access to the project and source repository. |
+| `ECOSCOPE_ELEBOT_PAT` | Elebot PAT used to read issues and post/update comments. Classic scope: `repo`; elebot needs write access to each source repository. The workflow verifies that the token authenticates as `ecoscope-elebot`. |
+| `FEATURE_READY_SLACK_WEBHOOK_URL` | Incoming webhook for the intended Slack channel. |
 
-### Slack feature reminders
+All assignees are mentioned in one comment. A hidden marker prevents duplicate
+comments; another records successful Slack delivery. If Slack fails, rerun the
+central job to retry Slack using the existing comment. A Slack timeout or a
+failure to save the delivery marker can cause a duplicate Slack message on
+retry. Changing project status after the closure run finishes does not trigger
+a new notification.
 
-`notify-slack-feature-ready-to-ship.yml` runs separately in this repository and
-reads its own `FEATURE_READY_SLACK_WEBHOOK_URL` Actions secret. Set that secret
-to the incoming webhook URL for the chosen Slack channel. Caller repositories
-do not need the Slack URL or any changes to their existing caller.
+The central workflows must merge before callers reference the new reusable
+workflow interface on `main`.
 
-After posting the feature reminder comment, the reusable workflow dispatches
-this Slack workflow with the comment text and link. A hidden comment marker
-records successful dispatches. If dispatch fails, rerun the calling job: it
-reuses the existing comment. Slack posting failures are reported in the separate
-workflow run here, which can be rerun independently.
+### Manual pre-merge test
 
-After this workflow is merged to `main` and the secret is configured, test Slack
-without closing an issue or posting a GitHub comment:
+This command starts the full feature check, elebot comment, and Slack delivery
+**in `.github`**, using the actual Compose Feature #3015. It does not close or
+move the issue. The existing registered checks workflow calls the new central
+workflow from the same branch, so a merge is not required for this test.
 
 ```sh
-slack_test_token="$(gh auth token --hostname github.com --user enlivn)" &&
-test -n "$slack_test_token" &&
-test "$(GH_TOKEN="$slack_test_token" gh api user --jq .login | tr '[:upper:]' '[:lower:]')" = enlivn &&
-GH_TOKEN="$slack_test_token" gh workflow run notify-slack-feature-ready-to-ship.yml \
-  --repo wildlife-dynamics/.github \
-  -f message="Slack integration test"
-```
-
-Before merge, use the existing manual checks workflow to run the Slack workflow
-from this branch with the secret stored in this repository:
-
-```sh
-slack_test_token="$(gh auth token --hostname github.com --user enlivn)" &&
-test -n "$slack_test_token" &&
-test "$(GH_TOKEN="$slack_test_token" gh api user --jq .login | tr '[:upper:]' '[:lower:]')" = enlivn &&
-GH_TOKEN="$slack_test_token" gh workflow run pull_request_checks.yml \
+feature_test_token="$(gh auth token --hostname github.com --user enlivn)" &&
+test -n "$feature_test_token" &&
+test "$(GH_TOKEN="$feature_test_token" gh api user --jq '.login | ascii_downcase')" = enlivn &&
+GH_TOKEN="$feature_test_token" gh workflow run pull_request_checks.yml \
   --repo wildlife-dynamics/.github \
   --ref codex/notify-slack-feature-ready \
-  -f test_slack=true
+  -f notify_feature=true \
+  -f repository=wildlife-dynamics/compose \
+  -f issue_number=3015
 ```
 
-The Slack workflow requires no GitHub API permissions. It posts the message as
-plain text, with an optional link to the GitHub comment.
-
-For a full pre-merge test, run Compose's manual entry point from the caller
-branch. GitHub CLI prompts for `issue_number`; enter an actual Compose Feature
-issue that is closed as completed, has an assignee, and is Done in Project 2:
+To also exercise the Compose dispatcher, use its existing manual entry point:
 
 ```sh
 feature_test_token="$(gh auth token --hostname github.com --user enlivn)" &&
@@ -102,14 +84,13 @@ test -n "$feature_test_token" &&
 test "$(GH_TOKEN="$feature_test_token" gh api user --jq '.login | ascii_downcase')" = enlivn &&
 GH_TOKEN="$feature_test_token" gh workflow run lint.yaml \
   --repo wildlife-dynamics/compose \
-  --ref codex/notify-feature-owners-ready-to-ship
+  --ref codex/notify-feature-owners-ready-to-ship \
+  -f issue_number=3015
 ```
 
-This uses Compose's existing `ECOSCOPE_ELEBOT_PAT` and GitHub issue-comment
-permissions. It runs the actual eligibility checks, posts the real reminder
-comment, and dispatches the Slack workflow from the test branch with that
-comment's text and link. It does not close or move the selected issue. Features
-already marked as successfully dispatched are not notified again.
+After merge, dispatch `notify-feature-ready-to-ship-to-production.yml` directly
+in `.github` with `repository` and `issue_number`; `notify_feature` is only an
+input of the pre-merge checks wrapper. Successful reminders are not sent twice.
 
 ### Automerge setup
 
