@@ -4,6 +4,8 @@
 #
 # Inputs:
 #   `project_number` (optional, number): Organization project number. Default: 2.
+#   `issue_number` (optional, number): Issue for a manual full-flow test.
+#   `slack_workflow_ref` (optional, string): Slack workflow branch. Default: main.
 # Secrets:
 #   `PROJECTS_READ_TOKEN` (required): Token with read access to the project and
 #     the calling repository's issues, and Actions write access to .github.
@@ -38,6 +40,16 @@ on:
         required: false
         type: number
         default: 2
+      issue_number:
+        description: Issue to check when manually testing the full flow
+        required: false
+        type: number
+        default: 0
+      slack_workflow_ref:
+        description: Branch of the central Slack workflow to run
+        required: false
+        type: string
+        default: main
     secrets:
       PROJECTS_READ_TOKEN:
         description: Token with project and issue read access, and Actions write access to .github
@@ -47,12 +59,15 @@ permissions:
   issues: write
 
 concurrency:
-  group: notify-feature-ready-to-ship-${{ github.repository }}-${{ github.event.issue.number }}
+  group: notify-feature-ready-to-ship-${{ github.repository }}-${{ inputs.issue_number || github.event.issue.number }}
   cancel-in-progress: false
 
 jobs:
   notify-feature-ready-to-ship:
     runs-on: ubuntu-latest
+    env:
+      FEATURE_ISSUE_NUMBER: ${{ inputs.issue_number }}
+      SLACK_WORKFLOW_REF: ${{ inputs.slack_workflow_ref }}
 
     steps:
       - name: Check feature and project status
@@ -63,17 +78,27 @@ jobs:
         with:
           github-token: ${{ secrets.PROJECTS_READ_TOKEN }}
           script: |
+            const manualTest = context.eventName === "workflow_dispatch";
+            const requestedIssue = Number(process.env.FEATURE_ISSUE_NUMBER);
+
+            if (manualTest && (!Number.isSafeInteger(requestedIssue) || requestedIssue <= 0)) {
+              core.setFailed("A manual feature test requires a positive issue_number.");
+              return false;
+            }
+
             if (
-              context.eventName !== "issues" ||
-              context.payload.action !== "closed" ||
-              context.payload.issue?.pull_request
+              !manualTest && (
+                context.eventName !== "issues" ||
+                context.payload.action !== "closed" ||
+                context.payload.issue?.pull_request
+              )
             ) {
               core.info("Ignoring event: not an issue closure.");
               return false;
             }
 
             const { owner, repo } = context.repo;
-            const issueNumber = context.issue.number;
+            const issueNumber = manualTest ? requestedIssue : context.issue.number;
             const { data: issue } = await github.rest.issues.get({
               owner,
               repo,
@@ -92,6 +117,7 @@ jobs:
               assignees.length === 0
             ) {
               core.info("Ignoring issue: not a completed Feature with an owner.");
+              if (manualTest) core.setFailed("The selected issue must be a closed, completed Feature with an assignee.");
               return false;
             }
 
@@ -148,6 +174,7 @@ jobs:
               if (item) {
                 const isDone = item.fieldValueByName?.name === "Done";
                 core.info(isDone ? "Feature is Done." : "Feature is not Done.");
+                if (manualTest && !isDone) core.setFailed("The selected Feature is not Done in the configured project.");
                 return isDone;
               }
 
@@ -155,6 +182,7 @@ jobs:
             } while (cursor);
 
             core.info("Ignoring issue: not in the configured project.");
+            if (manualTest) core.setFailed("The selected Feature is not in the configured project.");
             return false;
 
       - name: Notify feature owners
@@ -165,7 +193,7 @@ jobs:
         with:
           script: |
             const { owner, repo } = context.repo;
-            const issueNumber = context.issue.number;
+            const issueNumber = Number(process.env.FEATURE_ISSUE_NUMBER) || context.issue.number;
 
             // Recheck current ownership and closure before posting. Comments
             // use GITHUB_TOKEN; the separate token only reads the project and
@@ -225,8 +253,13 @@ jobs:
 
             // A separate run reads .github's own Slack secret. The caller's
             // GITHUB_TOKEN cannot dispatch workflows in another repository.
+            const workflowRef = process.env.SLACK_WORKFLOW_REF || "main";
+            const preMergeTest = context.eventName === "workflow_dispatch" && workflowRef !== "main";
+            const workflowFile = preMergeTest
+              ? "pull_request_checks.yml"
+              : "notify-slack-feature-ready-to-ship.yml";
             const response = await fetch(
-              `${process.env.GITHUB_API_URL}/repos/${owner}/.github/actions/workflows/notify-slack-feature-ready-to-ship.yml/dispatches`,
+              `${process.env.GITHUB_API_URL}/repos/${owner}/.github/actions/workflows/${workflowFile}/dispatches`,
               {
                 method: "POST",
                 headers: {
@@ -236,10 +269,11 @@ jobs:
                   "X-GitHub-Api-Version": "2026-03-10"
                 },
                 body: JSON.stringify({
-                  ref: "main",
+                  ref: workflowRef,
                   inputs: {
                     message: comment.body.replace(marker, "").trim(),
-                    comment_url: comment.html_url
+                    comment_url: comment.html_url,
+                    ...(preMergeTest ? { test_slack: "true" } : {})
                   }
                 }),
                 signal: AbortSignal.timeout(15000)

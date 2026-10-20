@@ -12,7 +12,7 @@ on:
         type: string
         default: ""
     secrets:
-      SLACK_FEATURE_READY_WEBHOOK_URL:
+      FEATURE_READY_SLACK_WEBHOOK_URL:
         required: true
   workflow_dispatch:
     inputs:
@@ -36,7 +36,7 @@ jobs:
       - name: Post to Slack
         uses: actions/github-script@v9
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_FEATURE_READY_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.FEATURE_READY_SLACK_WEBHOOK_URL }}
           MESSAGE: ${{ inputs.message }}
           COMMENT_URL: ${{ inputs.comment_url }}
         with:
@@ -46,7 +46,7 @@ jobs:
             const commentUrl = process.env.COMMENT_URL.trim();
 
             if (!webhookUrl) {
-              core.setFailed("Configure SLACK_FEATURE_READY_WEBHOOK_URL in this repository's Actions secrets.");
+              core.setFailed("Configure FEATURE_READY_SLACK_WEBHOOK_URL in this repository's Actions secrets.");
               return;
             }
 

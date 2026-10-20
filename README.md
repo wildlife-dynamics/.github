@@ -54,7 +54,7 @@ The reusable workflow must be merged here before callers reference it on `main`.
 ### Slack feature reminders
 
 `notify-slack-feature-ready-to-ship.yml` runs separately in this repository and
-reads its own `SLACK_FEATURE_READY_WEBHOOK_URL` Actions secret. Set that secret
+reads its own `FEATURE_READY_SLACK_WEBHOOK_URL` Actions secret. Set that secret
 to the incoming webhook URL for the chosen Slack channel. Caller repositories
 do not need the Slack URL or any changes to their existing caller.
 
@@ -91,6 +91,25 @@ GH_TOKEN="$slack_test_token" gh workflow run pull_request_checks.yml \
 
 The Slack workflow requires no GitHub API permissions. It posts the message as
 plain text, with an optional link to the GitHub comment.
+
+For a full pre-merge test, run Compose's manual entry point from the caller
+branch. GitHub CLI prompts for `issue_number`; enter an actual Compose Feature
+issue that is closed as completed, has an assignee, and is Done in Project 2:
+
+```sh
+feature_test_token="$(gh auth token --hostname github.com --user enlivn)" &&
+test -n "$feature_test_token" &&
+test "$(GH_TOKEN="$feature_test_token" gh api user --jq '.login | ascii_downcase')" = enlivn &&
+GH_TOKEN="$feature_test_token" gh workflow run lint.yaml \
+  --repo wildlife-dynamics/compose \
+  --ref codex/notify-feature-owners-ready-to-ship
+```
+
+This uses Compose's existing `ECOSCOPE_ELEBOT_PAT` and GitHub issue-comment
+permissions. It runs the actual eligibility checks, posts the real reminder
+comment, and dispatches the Slack workflow from the test branch with that
+comment's text and link. It does not close or move the selected issue. Features
+already marked as successfully dispatched are not notified again.
 
 ### Automerge setup
 
