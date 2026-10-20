@@ -47,6 +47,12 @@ Configure these Actions secrets **in `.github`**:
 | `ECOSCOPE_ELEBOT_PAT` | Elebot PAT used to read issues and post/update comments. Classic scope: `repo`; elebot needs write access to each source repository. The workflow verifies that the token authenticates as `ecoscope-elebot`. |
 | `FEATURE_READY_SLACK_WEBHOOK_URL` | Incoming webhook for the intended Slack channel. |
 
+Configure the `.github` Actions repository variable `GH_USERNAME_TO_SLACK_MEMBER_ID`
+with a JSON mapping, for example `{"enlivn":"U0123456789"}`. Mapped owners receive
+Slack mentions; unmapped owners appear as plain GitHub usernames. External owners
+must belong to the destination Slack Connect channel. GitHub comments retain
+GitHub mentions. Both messages include the feature number and title.
+
 All assignees are mentioned in one comment. A hidden marker prevents duplicate
 comments; another records successful Slack delivery. If Slack fails, rerun the
 central job to retry Slack using the existing comment. A Slack timeout or a
