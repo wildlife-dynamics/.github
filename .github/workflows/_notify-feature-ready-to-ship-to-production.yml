@@ -1,11 +1,13 @@
 # Notifies a closed Feature issue's assignees if its project Status is Done.
 # A hidden marker prevents duplicate comments after retries or repeated closure.
+# Dispatches a separate workflow in .github to post the reminder to Slack.
 #
 # Inputs:
 #   `project_number` (optional, number): Organization project number. Default: 2.
 # Secrets:
 #   `PROJECTS_READ_TOKEN` (required): Token with read access to the project and
-#     the calling repository's issues. Comments use the caller's GITHUB_TOKEN.
+#     the calling repository's issues, and Actions write access to .github.
+#     Comments use the caller's GITHUB_TOKEN.
 #
 # Example caller:
 #
@@ -38,7 +40,7 @@ on:
         default: 2
     secrets:
       PROJECTS_READ_TOKEN:
-        description: Token with read access to the project and repository issues
+        description: Token with project and issue read access, and Actions write access to .github
         required: true
 
 permissions:
@@ -158,13 +160,16 @@ jobs:
       - name: Notify feature owners
         if: steps.eligibility.outputs.result == 'true'
         uses: actions/github-script@v9
+        env:
+          NOTIFICATION_DISPATCH_TOKEN: ${{ secrets.PROJECTS_READ_TOKEN }}
         with:
           script: |
             const { owner, repo } = context.repo;
             const issueNumber = context.issue.number;
 
             // Recheck current ownership and closure before posting. Comments
-            // use GITHUB_TOKEN, keeping PROJECTS_READ_TOKEN read-only.
+            // use GITHUB_TOKEN; the separate token only reads the project and
+            // starts the Slack workflow in .github.
             const { data: issue } = await github.rest.issues.get({
               owner,
               repo,
@@ -191,27 +196,68 @@ jobs:
               github.rest.issues.listComments,
               { owner, repo, issue_number: issueNumber, per_page: 100 }
             );
-            const alreadyNotified = comments.some(
+            let comment = comments.find(
               comment =>
                 comment.user?.login === "github-actions[bot]" &&
                 comment.body?.includes(marker)
             );
 
-            if (alreadyNotified) {
-              core.info("Feature owners have already been notified.");
+            if (!comment) {
+              const mentions = assignees.map(assignee => `@${assignee.login}`).join(" ");
+
+              ({ data: comment } = await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                body: [
+                  marker,
+                  `${mentions} This feature is officially Done! 🎉 A feature shipped is a feature earned. Please land it on production ASAP. 🚀`
+                ].join("\n")
+              }));
+            }
+
+            const dispatchedMarker = "<!-- feature-ready-slack-dispatched -->";
+
+            if (comment.body.includes(dispatchedMarker)) {
+              core.info("Feature owners have already been notified in GitHub and Slack has been dispatched.");
               return;
             }
 
-            const mentions = assignees.map(assignee => `@${assignee.login}`).join(" ");
+            // A separate run reads .github's own Slack secret. The caller's
+            // GITHUB_TOKEN cannot dispatch workflows in another repository.
+            const response = await fetch(
+              `${process.env.GITHUB_API_URL}/repos/${owner}/.github/actions/workflows/notify-slack-feature-ready-to-ship.yml/dispatches`,
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${process.env.NOTIFICATION_DISPATCH_TOKEN}`,
+                  Accept: "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "X-GitHub-Api-Version": "2026-03-10"
+                },
+                body: JSON.stringify({
+                  ref: "main",
+                  inputs: {
+                    message: comment.body.replace(marker, "").trim(),
+                    comment_url: comment.html_url
+                  }
+                }),
+                signal: AbortSignal.timeout(15000)
+              }
+            );
 
-            await github.rest.issues.createComment({
+            if (!response.ok) {
+              core.setFailed(`GitHub comment exists, but Slack dispatch failed (HTTP ${response.status}). Check the token's Actions write access to .github, then rerun this job.`);
+              return;
+            }
+
+            // Failed dispatches leave the comment unmarked so a retry can
+            // dispatch Slack without posting another GitHub comment.
+            await github.rest.issues.updateComment({
               owner,
               repo,
-              issue_number: issueNumber,
-              body: [
-                marker,
-                `${mentions} This feature is officially Done! 🎉 A feature shipped is a feature earned. Please land it on production ASAP. 🚀`
-              ].join("\n")
+              comment_id: comment.id,
+              body: `${comment.body}\n${dispatchedMarker}`
             });
 
-            core.info("Feature owners notified that the feature is ready to ship.");
+            core.info("Feature owners notified in GitHub; Slack workflow dispatched.");

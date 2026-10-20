@@ -1,0 +1,88 @@
+name: Notify Slack that Feature is ready to ship
+
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: Message to post to the configured Slack channel
+        required: false
+        type: string
+        default: Slack integration test
+      comment_url:
+        description: Optional link to the feature reminder comment
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  notify-slack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post to Slack
+        uses: actions/github-script@v9
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_FEATURE_READY_WEBHOOK_URL }}
+          MESSAGE: ${{ inputs.message }}
+          COMMENT_URL: ${{ inputs.comment_url }}
+        with:
+          script: |
+            const webhookUrl = process.env.SLACK_WEBHOOK_URL;
+            const message = process.env.MESSAGE.trim();
+            const commentUrl = process.env.COMMENT_URL.trim();
+
+            if (!webhookUrl) {
+              core.setFailed("Configure SLACK_FEATURE_READY_WEBHOOK_URL in this repository's Actions secrets.");
+              return;
+            }
+
+            if (!message || message.length > 3000) {
+              core.setFailed("message must contain 1 to 3000 characters.");
+              return;
+            }
+
+            const blocks = [
+              { type: "section", text: { type: "plain_text", text: message } }
+            ];
+
+            if (commentUrl) {
+              const url = new URL(commentUrl);
+              const path = /^\/([^/]+)\/[A-Za-z0-9_.-]+\/issues\/[1-9]\d*$/;
+              const match = url.pathname.match(path);
+
+              if (
+                url.origin !== "https://github.com" ||
+                !match ||
+                match[1].toLowerCase() !== context.repo.owner.toLowerCase() ||
+                url.search ||
+                !/^#issuecomment-[1-9]\d*$/.test(url.hash)
+              ) {
+                core.setFailed("comment_url must link to an issue comment in this organization.");
+                return;
+              }
+
+              blocks.push({
+                type: "context",
+                elements: [
+                  { type: "mrkdwn", text: `<${commentUrl}|View GitHub comment>` }
+                ]
+              });
+            }
+
+            const response = await fetch(webhookUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                text: commentUrl ? `${message}\n${commentUrl}` : message,
+                blocks
+              }),
+              signal: AbortSignal.timeout(15000)
+            });
+
+            if (!response.ok) {
+              core.setFailed(`Slack notification failed (HTTP ${response.status}).`);
+              return;
+            }
+
+            core.info("Slack notification sent.");

@@ -39,6 +39,9 @@ the repository's issues. For a classic personal access token, this requires
 `read:project` and access to the repository (`repo` for private repositories).
 The token's account must also have access to the project. Project reads use
 this token; issue comments use the caller's `GITHUB_TOKEN` with `issues: write`.
+The same token also needs permission to dispatch workflows in this `.github`
+repository: the account needs repository write access, and fine-grained tokens
+need **Actions: read and write** here.
 
 All current GitHub assignees are mentioned in one comment, once per issue,
 including after retries or reopening and completing the feature again. Issues
@@ -47,6 +50,34 @@ and features outside Done are ignored. Changing project status after the
 closure run has finished does not trigger another check.
 
 The reusable workflow must be merged here before callers reference it on `main`.
+
+### Slack feature reminders
+
+`notify-slack-feature-ready-to-ship.yml` runs separately in this repository and
+reads its own `SLACK_FEATURE_READY_WEBHOOK_URL` Actions secret. Set that secret
+to the incoming webhook URL for the chosen Slack channel. Caller repositories
+do not need the Slack URL or any changes to their existing caller.
+
+After posting the feature reminder comment, the reusable workflow dispatches
+this Slack workflow with the comment text and link. A hidden comment marker
+records successful dispatches. If dispatch fails, rerun the calling job: it
+reuses the existing comment. Slack posting failures are reported in the separate
+workflow run here, which can be rerun independently.
+
+After this workflow is merged to `main` and the secret is configured, test Slack
+without closing an issue or posting a GitHub comment:
+
+```sh
+slack_test_token="$(gh auth token --hostname github.com --user enlivn)" &&
+test -n "$slack_test_token" &&
+test "$(GH_TOKEN="$slack_test_token" gh api user --jq .login | tr '[:upper:]' '[:lower:]')" = enlivn &&
+GH_TOKEN="$slack_test_token" gh workflow run notify-slack-feature-ready-to-ship.yml \
+  --repo wildlife-dynamics/.github \
+  -f message="Slack integration test"
+```
+
+The Slack workflow requires no GitHub API permissions. It posts the message as
+plain text, with an optional link to the GitHub comment.
 
 ### Automerge setup
 
