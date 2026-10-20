@@ -1,6 +1,19 @@
 name: Notify Slack that Feature is ready to ship
 
 on:
+  workflow_call:
+    inputs:
+      message:
+        required: false
+        type: string
+        default: Slack integration test
+      comment_url:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SLACK_FEATURE_READY_WEBHOOK_URL:
+        required: true
   workflow_dispatch:
     inputs:
       message:

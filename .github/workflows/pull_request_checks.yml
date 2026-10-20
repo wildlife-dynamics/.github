@@ -6,6 +6,12 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      test_slack:
+        description: Send a Slack integration-test message
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -15,6 +21,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  slack-test:
+    if: github.event_name == 'workflow_dispatch' && inputs.test_slack
+    permissions: {}
+    uses: ./.github/workflows/notify-slack-feature-ready-to-ship.yml
+    with:
+      message: Slack integration test
+    secrets:
+      SLACK_FEATURE_READY_WEBHOOK_URL: ${{ secrets.SLACK_FEATURE_READY_WEBHOOK_URL }}
+
   actionlint:
     name: Validate workflows with actionlint
     runs-on: ubuntu-latest

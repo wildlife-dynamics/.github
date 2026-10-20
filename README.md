@@ -76,6 +76,19 @@ GH_TOKEN="$slack_test_token" gh workflow run notify-slack-feature-ready-to-ship.
   -f message="Slack integration test"
 ```
 
+Before merge, use the existing manual checks workflow to run the Slack workflow
+from this branch with the secret stored in this repository:
+
+```sh
+slack_test_token="$(gh auth token --hostname github.com --user enlivn)" &&
+test -n "$slack_test_token" &&
+test "$(GH_TOKEN="$slack_test_token" gh api user --jq .login | tr '[:upper:]' '[:lower:]')" = enlivn &&
+GH_TOKEN="$slack_test_token" gh workflow run pull_request_checks.yml \
+  --repo wildlife-dynamics/.github \
+  --ref codex/notify-slack-feature-ready \
+  -f test_slack=true
+```
+
 The Slack workflow requires no GitHub API permissions. It posts the message as
 plain text, with an optional link to the GitHub comment.
 
