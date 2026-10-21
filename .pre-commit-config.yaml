@@ -7,6 +7,8 @@ repos:
     rev: v1.7.12
     hooks:
       - id: actionlint
+        # Match the narrow compatibility exception used by workflow CI.
+        args: ['-ignore', 'unexpected key "queue" for "concurrency" section\.']
 
   - repo: https://github.com/python-jsonschema/check-jsonschema
     rev: 0.37.2

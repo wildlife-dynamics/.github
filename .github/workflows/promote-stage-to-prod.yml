@@ -1,0 +1,523 @@
+# Dispatch runs own Slack credentials here. Reusable calls only verify a production PR.
+name: Report stage E2E result and prepare production promotion
+run-name: Production promotion for stage PR ${{ inputs.source_pr || inputs.production_pr }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_pr:
+        description: Merged Compose PR into stage
+        type: string
+        required: true
+      stage_sha:
+        description: Exact deployed and tested stage merge commit
+        type: string
+        required: true
+      stage_run_id:
+        description: Compose Deploy to Stage run
+        type: string
+        required: true
+      stage_run_attempt:
+        description: Stage run attempt
+        type: string
+        required: true
+  workflow_call:
+    inputs:
+      production_pr:
+        description: Production PR to verify without making changes
+        type: string
+        required: true
+    secrets:
+      ECOSCOPE_ELEBOT_PAT:
+        required: true
+      FEATURE_READY_SLACK_BOT_TOKEN:
+        required: false
+
+permissions: {}
+
+jobs:
+  promotion:
+    name: Production readiness
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      # Verification must run while the dispatcher is waiting for its PR checks.
+      group: central-prod-${{ inputs.production_pr || 'prepare' }}
+      cancel-in-progress: false
+      queue: max
+    env:
+      GH_TOKEN: ${{ secrets.ECOSCOPE_ELEBOT_PAT }}
+      SLACK_BOT_TOKEN: ${{ secrets.FEATURE_READY_SLACK_BOT_TOKEN }}
+      SLACK_MEMBERS: ${{ vars.GH_USERNAME_TO_SLACK_MEMBER_ID }}
+      SOURCE_PR: ${{ inputs.source_pr }}
+      STAGE_SHA: ${{ inputs.stage_sha }}
+      STAGE_RUN_ID: ${{ inputs.stage_run_id }}
+      STAGE_RUN_ATTEMPT: ${{ inputs.stage_run_attempt }}
+      PRODUCTION_PR: ${{ inputs.production_pr }}
+    steps:
+      - name: Verify stage evidence and prepare promotion
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          repo=wildlife-dynamics/compose
+          endpoint="repos/$repo"
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          # Pin the API that includes merge_commit_sha, required to prove the deployed PR merge.
+          api() { gh api -H 'X-GitHub-Api-Version: 2022-11-28' "$@"; }
+          fail() { echo "::error::$*" >&2; return 1; }
+          # Preserve HTTP status: a conflict is different from missing permissions or an outage.
+          request() {
+            local method=$1 path=$2 data=${3:-} raw
+            if [[ -n "$data" ]]; then
+              raw=$(printf '%s' "$data" | api --include --method "$method" "$path" --input - 2>"$work/http-error") || true
+            else
+              raw=$(api --include --method "$method" "$path" 2>"$work/http-error") || true
+            fi
+            http_code=$(printf '%s\n' "$raw" | awk 'NR == 1 {print $2}')
+            response=$(printf '%s\n' "$raw" | awk 'body {print} /^\r?$/ {body=1}')
+            if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+              cat "$work/http-error" >&2
+              return 1
+            fi
+          }
+          production_title() {
+            jq -er 'if (.title | startswith("STAGE:")) then .title | sub("^STAGE:";"PROD:")
+              else error("Stage PR title must begin with STAGE:") end'
+          }
+          production_body() {
+            jq -c --arg title "$1" --arg new_title "$2" '
+              (.body // "") | split("\n") |
+              reduce .[] as $line ({lines:[],expect_title:false};
+                if $line == "## :earth_americas: Summary" then
+                  .lines += [$line] | .expect_title = true
+                elif .expect_title and $line != "" then
+                  .lines += [(if $line == $title then $new_title else $line end)] | .expect_title = false
+                else .lines += [$line] end) | .lines | join("\n")'
+          }
+          feature_numbers() {
+            # Only explicit same-repository Related to references, one per line.
+            jq -r '.body // "" | split("\n")[] |
+              try capture("(?i)^\\s*Related to (?:#|https://github\\.com/wildlife-dynamics/compose/issues/)(?<n>[1-9][0-9]*)\\s*[.]?\\s*$").n catch empty' | sort -nu
+          }
+          thread_metadata() {
+            jq -ce '
+              [.[] | select((.user.login == "ecoscope-elebot" or .user.login == "github-actions[bot]") and
+                (.body | startswith("<!-- feature-ready-to-ship-to-production -->"))) |
+                .body | scan("<!-- feature-slack-thread:v1\\s*([\\s\\S]*?)\\s*-->") | .[0] | fromjson] |
+              if length != 1 then error("Expected one trusted feature Slack thread") else .[0] end |
+              if (.channel_id | type == "string" and test("^[CG][A-Z0-9]+$")) and
+                 (.thread_ts | type == "string" and test("^[0-9]+\\.[0-9]+$"))
+              then {channel_id,thread_ts} else error("Invalid saved Slack thread") end'
+          }
+          slack_mentions() {
+            jq -er --argjson users "$1" '
+              if type != "object" then error("Expected GitHub-to-Slack map") else
+                with_entries(.key |= ascii_downcase) as $members |
+                [$users[] | ascii_downcase | . as $login |
+                  $members[$login] // error("Missing Slack mapping for " + $login) |
+                  if type == "string" and test("^[UW][A-Z0-9]+$") then "<@" + . + ">"
+                  else error("Invalid Slack member ID") end] | unique | join(" ") end'
+          }
+          stage_pr_valid() {
+            jq -e --arg repo "$repo" --arg sha "$STAGE_SHA" '
+              .merged == true and .base.ref == "stage" and .head.ref != "prod" and
+              .base.repo.full_name == $repo and .head.repo.full_name == $repo and
+              .merge_commit_sha == $sha and (.user.login | length > 0)' >/dev/null
+          }
+          run_valid() {
+            jq -e --argjson pr "$source" --argjson attempt "$STAGE_RUN_ATTEMPT" --arg repo "$repo" '
+              .repository.full_name == $repo and .path == ".github/workflows/stage.yaml" and
+              .event == "pull_request" and .head_sha == $pr.head.sha and .head_branch == $pr.head.ref and
+              .run_attempt == $attempt and .status == "completed" and
+              (.conclusion == "success" or .conclusion == "failure") and
+              ((.created_at | fromdateiso8601) >= ($pr.merged_at | fromdateiso8601)) and
+              ((.created_at | fromdateiso8601) <= (($pr.merged_at | fromdateiso8601) + 600))' >/dev/null
+          }
+          deployment_valid() {
+            jq -e '
+              def succeeded($name): any(.[]; .name == $name and .conclusion == "success");
+              . as $jobs | succeeded("Verify stage revision") and succeeded("stage / post-exec / terragrunt") and
+              (["events", "patrols", "subject-tracking", "event-details", "download-events",
+                "download-patrols", "download-subject-tracks"] |
+                all(.[]; . as $template | $jobs | succeeded("bump-" + $template + "-template / bump")))
+            ' >/dev/null
+          }
+          e2e_failed() {
+            # Failed-job reruns may omit earlier deployment jobs; an actual E2E failure still needs a ping.
+            jq -e '
+              any(.[]; (.name | startswith("Run E2E tests after stage deployment /")) and
+                .conclusion == "failure")' >/dev/null
+          }
+          jobs_valid() {
+            local job_data
+            job_data=$(cat)
+            printf '%s' "$job_data" | deployment_valid || return 1
+            printf '%s' "$job_data" | jq -e '
+              all(.[]; (.conclusion != "failure" and .conclusion != "cancelled") or
+                .name == "Request production promotion or report E2E failure") and
+              any(.[]; (.name | startswith("Run E2E tests after stage deployment /")) and
+                .conclusion == "success" and any(.steps[]?; .name == "Run tests" and .conclusion == "success"))
+            ' >/dev/null
+          }
+          verify_evidence() {
+            source=$(api "$endpoint/pulls/$SOURCE_PR") || return 1
+            printf '%s' "$source" | stage_pr_valid || { fail 'Source is not the expected merged stage PR.'; return 1; }
+            # A dispatch starts before its caller exits; wait for the source run to finish.
+            local run latest jobs
+            for ((wait_count=0; wait_count<30; wait_count++)); do
+              run=$(api "$endpoint/actions/runs/$STAGE_RUN_ID/attempts/$STAGE_RUN_ATTEMPT") || return 1
+              [[ $(printf '%s' "$run" | jq -r .status) == completed ]] && break
+              sleep 10
+            done
+            printf '%s' "$run" | run_valid || { fail 'Stage deployment/E2E evidence is missing, stale, or unsuccessful.'; return 1; }
+            latest=$(api "$endpoint/actions/runs/$STAGE_RUN_ID") || return 1
+            [[ $(printf '%s' "$latest" | jq -r .run_attempt) == "$STAGE_RUN_ATTEMPT" ]] || {
+              fail 'A later stage run attempt invalidated this evidence.'; return 1;
+            }
+            jobs=$(api --paginate --slurp "$endpoint/actions/runs/$STAGE_RUN_ID/attempts/$STAGE_RUN_ATTEMPT/jobs?per_page=100" |
+              jq '[.[].jobs[]]') || return 1
+            if printf '%s' "$jobs" | jobs_valid; then
+              stage_result=passed
+            elif printf '%s' "$jobs" | e2e_failed; then
+              stage_result=failed
+            else
+              fail 'Deployment or E2E evidence is missing, skipped, cancelled, or invalid. Rerun all Deploy to Stage jobs to verify the deployed revision.'
+              return 1
+            fi
+          }
+          discover_evidence() {
+            local runs candidate
+            source=$(api "$endpoint/pulls/$SOURCE_PR") || return 1
+            runs=$(api --paginate --slurp "$endpoint/actions/workflows/stage.yaml/runs?event=pull_request&head_sha=$(printf '%s' "$source" | jq -r .head.sha)&per_page=100" |
+              jq --argjson pr "$source" '[.[].workflow_runs[] |
+                select(.head_branch == $pr.head.ref and .created_at >= $pr.merged_at)] | sort_by(.id) | reverse') || return 1
+            while IFS= read -r candidate; do
+              STAGE_RUN_ID=$(printf '%s' "$candidate" | jq -r .id)
+              STAGE_RUN_ATTEMPT=$(printf '%s' "$candidate" | jq -r .run_attempt)
+              if verify_evidence && [[ "$stage_result" == passed ]]; then return 0; fi
+            done < <(printf '%s' "$runs" | jq -c '.[]')
+            fail 'No successful stage deployment and E2E run proves this revision.'
+          }
+          tree() {
+            local sha
+            sha=$(api "$endpoint/git/commits/$1" --jq .tree.sha) || return 1
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+            printf '%s' "$sha"
+          }
+          ancestor() {
+            api "$endpoint/compare/$1...$2" --jq '.status' | { read -r status; [[ "$status" == ahead || "$status" == identical ]]; }
+          }
+          verify_tree() {
+            local actual expected
+            actual=$(tree "$1") || return 1
+            expected=$(tree "$STAGE_SHA") || return 1
+            [[ "$actual" == "$expected" ]] || return 1
+            ancestor "$STAGE_SHA" "$1" || return 1
+            ancestor "$2" "$1" || return 1
+          }
+          pr_head() { printf '%s' "$1" | jq -er .head.sha; }
+          branch_sha() {
+            local sha
+            sha=$(api "$endpoint/git/ref/heads/$1" --jq .object.sha) || return 1
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+            printf '%s' "$sha"
+          }
+          check_pr() {
+            local current=$1 base head
+            [[ $(printf '%s' "$current" | jq -r '.base.ref') == prod ]] || return 1
+            [[ $(printf '%s' "$current" | jq -r '.head.repo.full_name') == "$repo" ]] || return 1
+            head=$(pr_head "$current")
+            base=$(branch_sha prod)
+            verify_tree "$head" "$base" || { fail 'Production contents or ancestry differ from the tested stage revision.'; return 1; }
+            [[ $(branch_sha prod) == "$base" ]] || { fail 'Production changed during verification. Update the release and rerun.'; return 1; }
+          }
+          notify() {
+            local outcome=$1 number issue comments comment marker mentions slack_users slack_text github_text
+            local metadata id path payload status current state reply feature_failed failures=0
+            for number in "${features[@]}"; do
+              feature_failed=false
+              issue=$(api "$endpoint/issues/$number") || { failures=1; continue; }
+              mentions=$(printf '%s' "$issue" | jq -r --arg author "$author" --arg human "${responsible:-}" '
+                ([.assignees[].login] + [$author,$human] | map(select(length > 0)) | unique_by(ascii_downcase)) |
+                map("@" + .) | join(" ")')
+              slack_users=$(jq -nc --arg author "$author" --arg human "${responsible:-}" '[$author,$human] | map(select(length > 0)) | unique_by(ascii_downcase)')
+              case "$outcome" in
+                ready)
+                  github_text="$mentions E2E tests are 🟢 on \`stage\` for this Feature. Please smoke test \`stage\` as part of your due diligence, at your discretion. Once you're ready, a production [PR]($pr_url) is open for you to review and merge. 🎉"
+                  github_text+=$'\n\n**Reminder: please do NOT squash this PR.**'
+                  slack_text="E2E tests are 🟢 on \`stage\` for this Feature. Please smoke test \`stage\` as part of your due diligence, at your discretion. Once you're ready, a production <$pr_url|PR> is open for you to review and merge. 🎉"
+                  slack_text+=$'\n\n*Reminder: please do NOT squash this PR.*'
+                  ;;
+                e2e-failed)
+                  github_text="$mentions E2E tests are 🔴 on \`stage\` for this Feature. Please investigate the [failed E2E run]($e2e_run_url) for this [stage commit]($commit_url), and rerun the tests once the failure is resolved."
+                  github_text+=$'\n\nPlease hold off on promoting this Feature to `prod` until E2E tests pass.'
+                  slack_text="E2E tests are 🔴 on \`stage\` for this Feature. Please investigate the <$e2e_run_url|failed E2E run> for this <$commit_url|stage commit>, and rerun the tests once the failure is resolved."
+                  slack_text+=$'\n\nPlease hold off on promoting this Feature to `prod` until E2E tests pass.'
+                  ;;
+                blocked)
+                  github_text="$mentions E2E tests are 🟢 on \`stage\` for this Feature, but I was unable to create a PR to land this on \`prod\` because \`prod\` appears to contain changes missing from \`stage\` at the point your work merged ([stage commit]($commit_url)). This is unexpected."
+                  github_text+=$'\n\nPlease investigate the differences, complete any necessary smoke or E2E testing, and open a production PR when you\x27re ready.\n\n**Reminder: please do NOT squash the production PR.**'
+                  slack_text="E2E tests are 🟢 on \`stage\` for this Feature, but I was unable to create a PR to land this on \`prod\` because \`prod\` appears to contain changes missing from \`stage\` at the point your work merged (<$commit_url|stage commit>). This is unexpected."
+                  slack_text+=$'\n\nPlease investigate the differences, complete any necessary smoke or E2E testing, and open a production PR when you\x27re ready.\n\n*Reminder: please do NOT squash the production PR.*'
+                  ;;
+                existing)
+                  github_text="$mentions E2E tests are 🟢 on \`stage\` for this Feature. An existing [production PR]($pr_url) already includes this work. $responsible, please review and merge it ASAP. $author, please coordinate any smoke testing, review, and merge with them."
+                  github_text+=$'\n\n**Reminder: please do NOT squash this PR.**'
+                  slack_text="E2E tests are 🟢 on \`stage\` for this Feature. An existing <$pr_url|production PR> already includes this work. Please coordinate any smoke testing and review, and have the responsible author merge it ASAP."
+                  slack_text+=$'\n\n*Reminder: please do NOT squash this PR.*'
+                  ;;
+                error)
+                  github_text="$mentions Production promotion needs attention. Please inspect the [automation run]($run_url), fix the reported error, and retry the promotion workflow. Any production PR remains subject to review and successful checks."
+                  slack_text="Production promotion needs attention. Please inspect the <$run_url|automation run>, fix the reported error, and retry the promotion workflow. Any production PR remains subject to review and successful checks."
+                  ;;
+                *) return 1 ;;
+              esac
+              marker="<!-- stage-prod-promotion:v1 source_pr=$SOURCE_PR stage_sha=$STAGE_SHA stage_run_id=$STAGE_RUN_ID stage_run_attempt=$STAGE_RUN_ATTEMPT outcome=$outcome -->"
+              comments=$(api --paginate --slurp "$endpoint/issues/$number/comments?per_page=100" | jq add) || { failures=1; continue; }
+              comment=$(printf '%s' "$comments" | jq -c --arg marker "$marker" '
+                [.[] | select(.user.login == "ecoscope-elebot" and (.body | startswith($marker)))] |
+                if length > 1 then error("Duplicate promotion comments") else .[0] end') || { failures=1; continue; }
+              if [[ "$comment" == null ]]; then
+                payload=$(jq -n --arg body "$marker"$'\n'"$github_text" '{body:$body}')
+                comment=$(printf '%s' "$payload" | api --method POST "$endpoint/issues/$number/comments" --input -) || { failures=1; continue; }
+              fi
+              if printf '%s' "$comment" | jq -e '.body | contains("<!-- promotion-slack-sent:")' >/dev/null; then continue; fi
+              if printf '%s' "$comment" | jq -e '.body | contains("<!-- promotion-slack-pending -->")' >/dev/null; then
+                fail "Feature #$number has ambiguous Slack delivery; verify manually before clearing its pending marker." || true
+                failures=1
+                continue
+              fi
+              metadata=$(printf '%s' "$comments" | thread_metadata) || feature_failed=true
+              mentions=$(printf '%s' "$SLACK_MEMBERS" | slack_mentions "$slack_users") || feature_failed=true
+              if [[ "$feature_failed" == true || -z "$SLACK_BOT_TOKEN" ]]; then
+                fail "Feature #$number needs valid saved thread metadata, Slack mapping, and bot credentials." || true
+                failures=1
+                continue
+              fi
+              id=$(printf '%s' "$comment" | jq -er .id)
+              path="$endpoint/issues/comments/$id"
+              printf '%s' "$comment" | jq '{body:(.body + "\n<!-- promotion-slack-pending -->")}' |
+                api --method PATCH "$path" --input - --silent || { failures=1; continue; }
+              payload=$(printf '%s' "$metadata" | jq --arg text "$mentions $slack_text" '
+                {channel:.channel_id,thread_ts:.thread_ts,text:$text,unfurl_links:false,unfurl_media:false,
+                 blocks:[{type:"section",text:{type:"mrkdwn",text:$text,verbatim:true}}]}')
+              if ! status=$(curl --silent --show-error --max-time 30 --output "$work/slack" --write-out '%{http_code}' \
+                -H "Authorization: Bearer $SLACK_BOT_TOKEN" -H 'Content-Type: application/json' \
+                --data-binary "$payload" https://slack.com/api/chat.postMessage); then
+                fail "Feature #$number Slack delivery is ambiguous; verify before retrying." || true
+                failures=1
+                continue
+              fi
+              if [[ "$status" != 200 ]] || ! jq -e '.ok == true' "$work/slack" >/dev/null; then
+                if [[ "$status" =~ ^4[0-9][0-9]$ ]] || { [[ "$status" == 200 ]] && jq -e '.ok == false' "$work/slack" >/dev/null; }; then
+                  current=$(api "$path") || { failures=1; continue; }
+                  printf '%s' "$current" | jq '{body:(.body | split("\n<!-- promotion-slack-pending -->") | join(""))}' |
+                    api --method PATCH "$path" --input - --silent || true
+                fi
+                jq -c '{error,needed,provided}' "$work/slack" >&2 || true
+                fail "Feature #$number Slack request failed (HTTP $status). Inspect its delivery marker before retrying." || true
+                failures=1
+                continue
+              fi
+              reply=$(jq -ce --argjson saved "$metadata" '
+                if .channel == $saved.channel_id and .message.thread_ts == $saved.thread_ts and
+                  (.ts | type == "string" and test("^[0-9]+\\.[0-9]+$"))
+                then {channel_id:.channel,thread_ts:$saved.thread_ts,reply_ts:.ts}
+                else error("Invalid Slack reply identity") end' "$work/slack") || { failures=1; continue; }
+              state=$(jq -nc --argjson reply "$reply" --arg run "$STAGE_RUN_ID" --arg attempt "$STAGE_RUN_ATTEMPT" \
+                --arg pr "${pr_url:-}" '$reply + {stage_run_id:$run,stage_run_attempt:$attempt,production_pr:$pr}')
+              current=$(api "$path") || { failures=1; continue; }
+              printf '%s' "$current" | jq --arg state "$state" '
+                {body:((.body | split("\n<!-- promotion-slack-pending -->") | join("")) + "\n<!-- promotion-slack-sent:" + $state + " -->")}' |
+                api --method PATCH "$path" --input - --silent || { failures=1; continue; }
+            done
+            return "$failures"
+          }
+          on_error() {
+            local code=$?
+            trap - ERR
+            set +e
+            if [[ -z "$PRODUCTION_PR" && ${#features[@]} -gt 0 && -n "${author:-}" ]]; then notify error; fi
+            echo "::error::Promotion stopped; inspect this run. No approval or merge was performed."
+            exit "$code"
+          }
+          features=()
+          trap on_error ERR
+          [[ -n "$GH_TOKEN" ]]
+          [[ $(api user --jq '.login | ascii_downcase') == ecoscope-elebot ]]
+          if [[ -n "$PRODUCTION_PR" ]]; then
+            [[ "$GITHUB_REPOSITORY" == "$repo" && "$GITHUB_EVENT_NAME" == pull_request && "$PRODUCTION_PR" =~ ^[1-9][0-9]*$ ]]
+            [[ $(jq -r .number "$GITHUB_EVENT_PATH") == "$PRODUCTION_PR" ]]
+            pr=$(api "$endpoint/pulls/$PRODUCTION_PR")
+            [[ $(pr_head "$pr") == "$(jq -er .pull_request.head.sha "$GITHUB_EVENT_PATH")" ]] || fail 'The PR head changed; a new readiness check is required.'
+            head_ref=$(printf '%s' "$pr" | jq -r .head.ref)
+            if [[ "$head_ref" =~ ^codex/prod-stage-([1-9][0-9]*)-([a-f0-9]{40})$ ]]; then
+              SOURCE_PR=${BASH_REMATCH[1]}
+              STAGE_SHA=${BASH_REMATCH[2]}
+            elif [[ "$head_ref" == stage ]]; then
+              STAGE_SHA=$(pr_head "$pr")
+              SOURCE_PR=$(api --paginate --slurp "$endpoint/commits/$STAGE_SHA/pulls?per_page=100" |
+                jq -er --arg sha "$STAGE_SHA" '[.[][] | select(.merged_at != null and .base.ref == "stage" and .merge_commit_sha == $sha)] |
+                if length == 1 then .[0].number else error("Cannot identify stage merge PR") end')
+            else
+              fail 'Use stage or a snapshot named codex/prod-stage-<stage-PR>-<tested-merge-SHA>, with successful stage deployment and E2E evidence.'
+            fi
+            discover_evidence
+            check_pr "$pr"
+            # Catch a force-push while this check was running.
+            [[ $(api "$endpoint/pulls/$PRODUCTION_PR" --jq .head.sha) == "$(pr_head "$pr")" ]]
+            echo 'Production contents and ancestry match the revision with successful stage deployment and E2E.'
+            exit 0
+          fi
+
+          [[ "$GITHUB_REPOSITORY" == wildlife-dynamics/.github && "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$SOURCE_PR" =~ ^[1-9][0-9]*$ && "$STAGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$STAGE_RUN_ID" =~ ^[1-9][0-9]*$ && "$STAGE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          run_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          commit_url="https://github.com/$repo/commit/$STAGE_SHA"
+          e2e_run_url="https://github.com/$repo/actions/runs/$STAGE_RUN_ID/attempts/$STAGE_RUN_ATTEMPT"
+          verify_evidence
+          author=$(printf '%s' "$source" | jq -er .user.login)
+          numbers=$(printf '%s' "$source" | feature_numbers)
+          while IFS= read -r number; do
+            [[ -n "$number" ]] || continue
+            issue=$(api "$endpoint/issues/$number")
+            if printf '%s' "$issue" | jq -e '(.type | if type == "object" then .name else . end) == "Feature" and .pull_request == null' >/dev/null; then
+              features+=("$number")
+            fi
+          done <<< "$numbers"
+          [[ ${#features[@]} -gt 0 ]] || { echo 'No explicit linked Feature; no feature promotion requested.'; exit 0; }
+          if [[ "$stage_result" == failed ]]; then
+            notify e2e-failed
+            echo 'Stage E2E failure reported; no production promotion prepared.'
+            exit 0
+          fi
+          title=$(printf '%s' "$source" | production_title)
+          body=$(printf '%s' "$source" | production_body "$(printf '%s' "$source" | jq -r .title)" "$title")
+
+          branch="codex/prod-stage-$SOURCE_PR-$STAGE_SHA"
+          existing=$(api "$endpoint/pulls?state=all&base=prod&head=wildlife-dynamics:$branch&per_page=100" |
+            jq -c 'if length > 1 then error("Duplicate release PRs") else .[0] end')
+          if [[ "$existing" != null ]]; then
+            [[ $(printf '%s' "$existing" | jq -r '.user.login | ascii_downcase') == ecoscope-elebot ]]
+            if [[ $(printf '%s' "$existing" | jq -r .state) == closed ]]; then
+              echo 'This deployment already has a closed production PR; preserving it.'
+              exit 0
+            fi
+          fi
+
+          # A direct stage PR moves with stage. Leave it untouched, including its assignments.
+          direct=$(api "$endpoint/pulls?state=open&base=prod&head=wildlife-dynamics:stage&per_page=100" |
+            jq -c 'if length > 1 then error("Multiple stage-to-prod PRs") else .[0] end')
+          direct_contains=false
+          if [[ "$direct" != null ]]; then
+            comparison=$(api "$endpoint/compare/$STAGE_SHA...$(pr_head "$direct")" --jq .status)
+            if [[ "$comparison" == ahead || "$comparison" == identical ]]; then direct_contains=true; fi
+          fi
+          if [[ "$direct_contains" == true ]]; then
+            pr_number=$(printf '%s' "$direct" | jq -r .number)
+            pr_url=$(printf '%s' "$direct" | jq -r .html_url)
+            responsible=$(printf '%s' "$direct" | jq -r '.user.login')
+            if [[ "${responsible,,}" == ecoscope-elebot ]]; then
+              responsible=$(printf '%s' "$direct" | jq -r '[.assignees[].login | select(ascii_downcase != "ecoscope-elebot")][0] // empty')
+              if [[ -z "$responsible" ]]; then
+                origin=$(api "$endpoint/commits/$(pr_head "$direct")/pulls?per_page=100" |
+                  jq -er '[.[] | select(.merged_at != null and .base.ref == "stage")] | sort_by(.merged_at) | last | .user.login')
+                [[ "${origin,,}" != ecoscope-elebot ]]
+                responsible=$origin
+              fi
+            fi
+            notify existing
+            exit 0
+          fi
+
+          created=false
+          if request GET "$endpoint/git/ref/heads/$branch"; then
+            head=$(printf '%s' "$response" | jq -er .object.sha)
+            # Prod may have advanced, but independently changed release contents must stay untouched.
+            actual_tree=$(tree "$head")
+            expected_tree=$(tree "$STAGE_SHA")
+            [[ "$actual_tree" == "$expected_tree" ]] || fail 'Release branch contents changed independently; refusing to update it.'
+            ancestor "$STAGE_SHA" "$head" || fail 'Release branch lost its tested stage ancestry; refusing to update it.'
+          elif [[ "$http_code" == 404 ]]; then
+            request POST "$endpoint/git/refs" "$(jq -nc --arg ref "refs/heads/$branch" --arg sha "$STAGE_SHA" '{ref:$ref,sha:$sha}')"
+            head=$STAGE_SHA
+            created=true
+          else
+            fail 'Cannot inspect the production release branch.'
+          fi
+          for ((revision=0; revision<5; revision++)); do
+            prod=$(branch_sha prod)
+            [[ $(branch_sha "$branch") == "$head" ]] || fail 'Release branch changed independently; refusing to update it.'
+            if [[ "$existing" != null ]] && ! ancestor "$prod" "$head"; then
+              current=$(api "$endpoint/pulls/$(printf '%s' "$existing" | jq -r .number)")
+              if [[ $(printf '%s' "$current" | jq -r .draft) == false ]]; then
+                gh pr ready "$(printf '%s' "$existing" | jq -r .number)" --undo --repo "$repo"
+              fi
+            fi
+            conflict=false
+            if request POST "$endpoint/merges" "$(jq -nc --arg base "$branch" --arg head "$prod" \
+              '{base:$base,head:$head,commit_message:"Merge production history into tested stage snapshot"}')"; then
+              if [[ "$http_code" != 204 ]]; then head=$(printf '%s' "$response" | jq -er .sha); fi
+            elif [[ "$http_code" == 409 ]]; then
+              conflict=true
+            else
+              fail 'Production history merge failed for an API or permission reason.'
+            fi
+            actual_tree=$(tree "$head")
+            expected_tree=$(tree "$STAGE_SHA")
+            if [[ "$conflict" == true || "$actual_tree" != "$expected_tree" ]]; then
+              if [[ "$existing" == null && "$created" == true && $(branch_sha "$branch") == "$head" ]]; then
+                request DELETE "$endpoint/git/refs/heads/$branch"
+              fi
+              [[ "$existing" == null ]] || fail 'Production changed after a draft was opened. Investigate the existing draft.'
+              notify blocked
+              exit 0
+            fi
+            verify_tree "$head" "$prod"
+            if [[ "$existing" == null ]]; then
+              payload=$(jq -nc --arg head "$branch" --arg title "$title" --argjson body "$body" '{base:"prod",head:$head,title:$title,body:$body,draft:true,maintainer_can_modify:false}')
+              existing=$(printf '%s' "$payload" | api --method POST "$endpoint/pulls" --input -)
+            fi
+            pr_number=$(printf '%s' "$existing" | jq -er .number)
+            pr_url=$(printf '%s' "$existing" | jq -er .html_url)
+            jq -nc --arg author "$author" '{assignees:[$author]}' |
+              api --method POST "$endpoint/issues/$pr_number/assignees" --input - --silent
+            # Await automated checks only; human approval remains manual.
+            for ((poll=0; poll<90; poll++)); do
+              current=$(api "$endpoint/pulls/$pr_number")
+              [[ $(printf '%s' "$current" | jq -r .state) == open && $(pr_head "$current") == "$head" ]] || fail 'Production PR changed while awaiting checks.'
+              [[ $(branch_sha prod) == "$prod" ]] || break
+              code=0
+              required=$(gh pr checks "$pr_number" --repo "$repo" --required --json name,bucket) || code=$?
+              [[ "$code" == 0 || "$code" == 1 || "$code" == 8 ]] || fail 'Cannot inspect required production checks.'
+              code=0
+              all=$(gh pr checks "$pr_number" --repo "$repo" --json name,bucket) || code=$?
+              [[ "$code" == 0 || "$code" == 1 || "$code" == 8 ]] || fail 'Cannot inspect production readiness.'
+              if printf '%s' "$required" | jq -e 'any(.[]; .bucket == "fail" or .bucket == "cancel")' >/dev/null; then
+                fail 'A required production check failed. The PR remains draft.'
+              fi
+              if printf '%s' "$required" | jq -e 'length > 0 and all(.[]; .bucket == "pass")' >/dev/null &&
+                 printf '%s' "$all" | jq -e 'any(.[]; .name == "Production release / Production readiness" and .bucket == "pass")' >/dev/null; then
+                break
+              fi
+              sleep 20
+            done
+            [[ $(branch_sha prod) == "$prod" ]] || continue
+            [[ "$poll" -lt 90 ]] || fail 'Timed out awaiting required production checks. Retry promotion without redeploying stage.'
+            verify_evidence
+            [[ "$stage_result" == passed ]] || fail 'Stage E2E is no longer successful; the production PR cannot be announced ready.'
+            current=$(api "$endpoint/pulls/$pr_number")
+            [[ $(pr_head "$current") == "$head" ]]
+            verify_tree "$head" "$prod"
+            [[ $(branch_sha prod) == "$prod" ]] || continue
+            if [[ $(printf '%s' "$current" | jq -r .draft) == true ]]; then
+              gh pr ready "$pr_number" --repo "$repo"
+            fi
+            [[ $(branch_sha prod) == "$prod" ]] || continue
+            notify ready
+            echo "Production PR ready for manual review and merge: $pr_url"
+            exit 0
+          done
+          fail 'Production kept advancing; rerun promotion after the release settles.'
