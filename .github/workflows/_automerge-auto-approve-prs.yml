@@ -1,10 +1,20 @@
 # Enables squash auto-merge for non-draft pull requests labeled `automerge`.
-# Matching pull requests authored by `ecoscope-elebot` are also auto-approved.
+# Matching pull requests authored by `ecoscope-elebot` are also auto-approved, as are matching
+# pull requests for which the caller passes `auto_approve: true`.
+#
+# The caller decides whether a pull request is eligible for `auto_approve`; this workflow only
+# approves and enables auto-merge. Approvals granted through `auto_approve` (for non-elebot authors)
+# carry the hidden marker `<!-- wildlife-dynamics/.github:automerge-auto-approve -->` so callers can
+# find and dismiss them if the pull request later stops qualifying.
 #
 # Inputs:
 #   `pull_request_is_draft` (required, boolean): Whether the pull request is a draft.
 #   `pull_request_author_github_username` (required, string): Pull request author.
 #   `pull_request_label_names_serialized_list` (required, string): JSON label names.
+#   `auto_approve` (optional, boolean, default `false`): Approve even if the author is not
+#     `ecoscope-elebot`. The `automerge` label and non-draft conditions still apply.
+#   `pull_request_head_sha` (optional, string, default ``): Head commit the caller inspected. When
+#     set, nothing is approved or enabled unless the pull request head still matches it.
 #
 # Secrets:
 #   `PAT` (required): Bot token with permission to merge in the calling repository.
@@ -45,6 +55,16 @@ on:
       pull_request_label_names_serialized_list:
         type: string
         required: true
+      auto_approve:
+        description: Approve the pull request even if its author is not `ecoscope-elebot`. The caller decides eligibility.
+        type: boolean
+        required: false
+        default: false
+      pull_request_head_sha:
+        description: Head commit the caller inspected. When set, approval and auto-merge only happen if the pull request head still matches it.
+        type: string
+        required: false
+        default: ""
     secrets:
       PAT:
         required: true
@@ -59,14 +79,36 @@ jobs:
       pull-requests: write
     if: inputs.pull_request_is_draft == false && contains(fromJson(inputs.pull_request_label_names_serialized_list), 'automerge')
     steps:
+      - name: Check pull request head and auto-merge state
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ inputs.pull_request_head_sha }}
+        run: |
+          set -euo pipefail
+          pr=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
+          head_sha=$(jq -r '.head.sha' <<<"$pr")
+          if [ -n "$EXPECTED_HEAD_SHA" ] && [ "$head_sha" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "::notice::Head moved from $EXPECTED_HEAD_SHA to $head_sha after it was inspected; not enabling auto-merge. A newer run will re-evaluate."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+          # Do not override auto-merge someone (or an earlier run) already enabled, possibly with
+          # another merge method, and do not repeat the comment below on every re-run.
+          echo "already_enabled=$(jq -r '.auto_merge != null' <<<"$pr")" >> "$GITHUB_OUTPUT"
+
       - id: enable-automerge
+        if: steps.state.outputs.proceed == 'true' && steps.state.outputs.already_enabled != 'true'
         uses: alexwilson/enable-github-automerge-action@1.0.0
         with:
           github-token: ${{ secrets.PAT }}
           merge-method: SQUASH
 
       - name: Inform user that automerge was enabled
-        if: steps.enable-automerge.outcome == 'success'
+        if: steps.enable-automerge.outcome == 'success' && (!inputs.auto_approve || inputs.pull_request_author_github_username == 'ecoscope-elebot')
         uses: peter-evans/create-or-update-comment@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -74,15 +116,50 @@ jobs:
           body: |
             ℹ️ @${{ inputs.pull_request_author_github_username }} since you've added the `automerge` label, I have enabled automerge on this PR. Your PR will merge automatically once the required approvals and checks are satisfied.
 
+      - name: Inform user that automerge was enabled for a caller-approved PR
+        if: steps.enable-automerge.outcome == 'success' && inputs.auto_approve && inputs.pull_request_author_github_username != 'ecoscope-elebot'
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ℹ️ @${{ inputs.pull_request_author_github_username }} this PR qualifies for automatic approval, so I have enabled automerge on it. It will merge automatically once the required checks pass. If it stops qualifying, the automatic approval and automerge are withdrawn.
+
   auto-approve-elebot-updates:
     name: Auto-approve elebot PRs
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
-    if: inputs.pull_request_is_draft == false && inputs.pull_request_author_github_username == 'ecoscope-elebot' && contains(fromJson(inputs.pull_request_label_names_serialized_list), 'automerge')
+    if: inputs.pull_request_is_draft == false && (inputs.pull_request_author_github_username == 'ecoscope-elebot' || inputs.auto_approve) && contains(fromJson(inputs.pull_request_label_names_serialized_list), 'automerge')
     steps:
-      - id: auto-approve-ecoscope-elebot
-        uses: hmarr/auto-approve-action@v4
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          review-message: "✅ Auto-approved ecoscope-elebot PR."
+      - id: auto-approve
+        name: Approve the pull request head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_HEAD_SHA: ${{ inputs.pull_request_head_sha }}
+          AUTHOR: ${{ inputs.pull_request_author_github_username }}
+          APPROVAL_MARKER: "<!-- wildlife-dynamics/.github:automerge-auto-approve -->"
+        run: |
+          set -euo pipefail
+          head_sha=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha')
+          if [ -n "$EXPECTED_HEAD_SHA" ] && [ "$head_sha" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "::notice::Head moved from $EXPECTED_HEAD_SHA to $head_sha after it was inspected; not approving. A newer run will re-evaluate."
+            exit 0
+          fi
+          existing=$(gh api --paginate --slurp "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" \
+            | jq --arg sha "$head_sha" '[.[][] | select(.user.login == "github-actions[bot]" and .state == "APPROVED" and .commit_id == $sha)] | length')
+          if [ "$existing" != "0" ]; then
+            echo "::notice::$head_sha is already approved by github-actions[bot]; nothing to do."
+            exit 0
+          fi
+          if [ "$AUTHOR" = "ecoscope-elebot" ]; then
+            body="✅ Auto-approved ecoscope-elebot PR."
+          else
+            body=$(printf '✅ Auto-approved: the calling workflow marked this PR as eligible.\n\n%s' "$APPROVAL_MARKER")
+          fi
+          # Pin the review to the inspected commit rather than whatever the head is by now.
+          gh api -X POST "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+            -f event=APPROVE -f commit_id="$head_sha" -f body="$body" > /dev/null
+          echo "Approved $head_sha."
