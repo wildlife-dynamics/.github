@@ -56,7 +56,7 @@ jobs:
     secrets:
       ECOSCOPE_ELEBOT_PAT: ${{ secrets.ECOSCOPE_ELEBOT_PAT }}
       RAY_TEMPORARY_PAT_TOKEN_WHILE_ELEBOT_GETS_PROJECT_READ_ACCESS: ${{ secrets.RAY_TEMPORARY_PAT_TOKEN_WHILE_ELEBOT_GETS_PROJECT_READ_ACCESS }}
-      FEATURE_READY_SLACK_WEBHOOK_URL: ${{ secrets.FEATURE_READY_SLACK_WEBHOOK_URL }}
+      FEATURE_READY_SLACK_BOT_TOKEN: ${{ secrets.FEATURE_READY_SLACK_BOT_TOKEN }}
 
   actionlint:
     name: Validate workflows with actionlint
@@ -70,7 +70,8 @@ jobs:
       - name: Run actionlint
         uses: docker://rhysd/actionlint:1.7.12
         with:
-          args: -color
+          # actionlint 1.7.12 predates GitHub's supported concurrency.queue property.
+          args: -color -ignore=unexpected\x20key\x20\x22queue\x22\x20for\x20\x22concurrency\x22\x20section\.
 
   issue-forms:
     name: Validate issue forms with check-jsonschema
