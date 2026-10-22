@@ -1,6 +1,6 @@
 name: Pull request checks
 run-name: >-
-  ${{ inputs.notify_feature && format('Feature shipment notification for {0}#{1}', inputs.repository, inputs.issue_number) || '' }}
+  ${{ inputs.notify_feature && format('Shipment notification for {0}#{1}', inputs.repository, inputs.issue_number) || '' }}
 
 on:
   pull_request:
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       notify_feature:
-        description: Run the complete feature notification flow in .github
+        description: Run the complete Feature or Bug notification flow in .github
         required: false
         type: boolean
         default: false
@@ -20,7 +20,7 @@ on:
         type: string
         default: ""
       issue_number:
-        description: Feature issue number in the source repository
+        description: Feature or Bug issue number in the source repository
         required: false
         type: string
         default: ""
@@ -97,6 +97,18 @@ jobs:
           --schemafile "$ISSUE_FORMS_SCHEMA"
           .github/ISSUE_TEMPLATE/Bug.yml
           .github/ISSUE_TEMPLATE/Feature.yml
+
+  feature-delivery-tests:
+    name: Test Feature and Bug notifications offline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: python3 -m unittest discover -s tests -v
 
   zizmor:
     name: Audit workflows with zizmor
