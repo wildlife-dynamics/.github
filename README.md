@@ -43,8 +43,7 @@ Configure these Actions secrets **in `.github`**:
 
 | Secret | Purpose and access |
 | --- | --- |
-| `RAY_TEMPORARY_PAT_TOKEN_WHILE_ELEBOT_GETS_PROJECT_READ_ACCESS` | Personal PAT used only for project reads. Classic scopes: `repo` and `read:project`. Its account needs read access to the project and source repository. |
-| `ECOSCOPE_ELEBOT_PAT` | Elebot PAT used to read issues and post/update comments. Classic scope: `repo`; elebot needs write access to each source repository. The workflow verifies that the token authenticates as `ecoscope-elebot`. |
+| `ECOSCOPE_ELEBOT_PAT` | Elebot PAT used to read projects and issues and post/update comments. Classic scopes: `repo` and `read:project`; elebot needs read access to the configured project and write access to each source repository. The workflow verifies that the token authenticates as `ecoscope-elebot`. |
 | `FEATURE_READY_SLACK_WEBHOOK_URL` | Incoming webhook for the intended Slack channel. |
 
 Configure the `.github` Actions repository variable `GH_USERNAME_TO_SLACK_MEMBER_ID`

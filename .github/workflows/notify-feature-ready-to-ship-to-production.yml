@@ -1,4 +1,4 @@
-# Runs in .github; the personal PAT is used only for project reads.
+# Runs in .github; elebot reads projects and posts issue comments.
 name: Notify feature owners that Feature is ready to ship
 run-name: Feature shipment notification for ${{ inputs.repository }}#${{ inputs.issue_number }}
 
@@ -38,8 +38,6 @@ on:
     secrets:
       ECOSCOPE_ELEBOT_PAT:
         required: true
-      RAY_TEMPORARY_PAT_TOKEN_WHILE_ELEBOT_GETS_PROJECT_READ_ACCESS:
-        required: true
       FEATURE_READY_SLACK_BOT_TOKEN:
         required: true
 
@@ -56,7 +54,6 @@ jobs:
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ secrets.ECOSCOPE_ELEBOT_PAT }}
-      PROJECT_READ_TOKEN: ${{ secrets.RAY_TEMPORARY_PAT_TOKEN_WHILE_ELEBOT_GETS_PROJECT_READ_ACCESS }}
       SLACK_BOT_TOKEN: ${{ secrets.FEATURE_READY_SLACK_BOT_TOKEN }}
       SOURCE_REPOSITORY: ${{ inputs.repository }}
       FEATURE_ISSUE_NUMBER: ${{ inputs.issue_number }}
@@ -92,7 +89,7 @@ jobs:
           [[ "$GITHUB_REPOSITORY" == wildlife-dynamics/.github ]]
           [[ "$SOURCE_REPOSITORY" =~ ^wildlife-dynamics/[A-Za-z0-9_.-]+$ ]]
           [[ "$FEATURE_ISSUE_NUMBER" =~ ^[1-9][0-9]*$ && "$PROJECT_NUMBER" =~ ^[1-9][0-9]*$ ]]
-          [[ -n "$GH_TOKEN" && -n "$PROJECT_READ_TOKEN" ]]
+          [[ -n "$GH_TOKEN" ]]
           [[ $(api user --jq '.login | ascii_downcase') == ecoscope-elebot ]]
           issue_path="repos/$SOURCE_REPOSITORY/issues/$FEATURE_ISSUE_NUMBER"
           issue=$(api "$issue_path")
@@ -123,7 +120,7 @@ jobs:
           cursor=null
           done_in_project=false
           while :; do
-            page=$(GH_TOKEN="$PROJECT_READ_TOKEN" api graphql -f query="$query" \
+            page=$(api graphql -f query="$query" \
               -f owner=wildlife-dynamics -f repo="${SOURCE_REPOSITORY#*/}" \
               -F issue="$FEATURE_ISSUE_NUMBER" -F project="$PROJECT_NUMBER" -F cursor="$cursor")
             project_id=$(printf '%s' "$page" | jq -er '.data.organization.projectV2.id')

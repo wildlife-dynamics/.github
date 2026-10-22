@@ -55,7 +55,6 @@ jobs:
       fail_if_ineligible: ${{ inputs.fail_if_ineligible }}
     secrets:
       ECOSCOPE_ELEBOT_PAT: ${{ secrets.ECOSCOPE_ELEBOT_PAT }}
-      RAY_TEMPORARY_PAT_TOKEN_WHILE_ELEBOT_GETS_PROJECT_READ_ACCESS: ${{ secrets.RAY_TEMPORARY_PAT_TOKEN_WHILE_ELEBOT_GETS_PROJECT_READ_ACCESS }}
       FEATURE_READY_SLACK_BOT_TOKEN: ${{ secrets.FEATURE_READY_SLACK_BOT_TOKEN }}
 
   actionlint:
