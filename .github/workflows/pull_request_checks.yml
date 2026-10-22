@@ -1,6 +1,6 @@
 name: Pull request checks
 run-name: >-
-  ${{ inputs.notify_feature && format('Feature shipment notification for {0}#{1}', inputs.repository, inputs.issue_number) || '' }}
+  ${{ inputs.notify_feature && format('Shipment notification for {0}#{1}', inputs.repository, inputs.issue_number) || '' }}
 
 on:
   pull_request:
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       notify_feature:
-        description: Run the complete feature notification flow in .github
+        description: Run the complete Feature or Bug notification flow in .github
         required: false
         type: boolean
         default: false
@@ -20,7 +20,7 @@ on:
         type: string
         default: ""
       issue_number:
-        description: Feature issue number in the source repository
+        description: Feature or Bug issue number in the source repository
         required: false
         type: string
         default: ""

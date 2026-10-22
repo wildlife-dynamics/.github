@@ -1,6 +1,6 @@
 # Runs in .github; elebot reads projects and posts issue comments.
-name: Notify feature owners that Feature is ready to ship
-run-name: Feature shipment notification for ${{ inputs.repository }}#${{ inputs.issue_number }}
+name: Notify owners that a Feature or Bug is ready to ship
+run-name: Shipment notification for ${{ inputs.repository }}#${{ inputs.issue_number }}
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
         required: true
         type: string
       issue_number:
-        description: Completed Feature issue
+        description: Completed Feature or Bug issue
         required: true
         type: string
       project_number:
@@ -62,14 +62,15 @@ jobs:
       SLACK_CHANNEL: ${{ vars.FEATURE_READY_SLACK_CHANNEL_ID }}
       SLACK_MEMBERS: ${{ vars.GH_USERNAME_TO_SLACK_MEMBER_ID }}
     steps:
-      - name: Check feature and notify its owners
+      - name: Check issue and notify its owners
         shell: bash
         run: |
           set -euo pipefail
           api() { gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$@"; }
           eligible() {
             jq -e '
-              (.type | if type == "object" then .name else . end) == "Feature" and
+              (.type | if type == "object" then .name else . end) as $kind |
+              ($kind == "Feature" or $kind == "Bug") and
               .pull_request == null and .state == "closed" and
               .state_reason == "completed" and (.assignees | length > 0)
             ' >/dev/null
@@ -94,10 +95,10 @@ jobs:
           issue_path="repos/$SOURCE_REPOSITORY/issues/$FEATURE_ISSUE_NUMBER"
           issue=$(api "$issue_path")
           if ! printf '%s' "$issue" | eligible; then
-            reject_ineligible 'Ignoring issue: not a completed Feature with an owner.'
+            reject_ineligible 'Ignoring issue: not a completed Feature or Bug with an owner.'
           fi
 
-          # Only this organization's configured project can make the feature eligible.
+          # Only this organization's configured project can make the issue eligible.
           query=$(cat <<'GRAPHQL'
           query($owner: String!, $repo: String!, $issue: Int!, $project: Int!, $cursor: String) {
             organization(login: $owner) { projectV2(number: $project) { id } }
@@ -133,30 +134,36 @@ jobs:
             [[ $(printf '%s' "$page" | jq -r '.data.repository.issue.projectItems.pageInfo.hasNextPage') == true ]] || break
             cursor=$(printf '%s' "$page" | jq -er '.data.repository.issue.projectItems.pageInfo.endCursor')
           done
-          [[ "$done_in_project" == true ]] || reject_ineligible 'Feature is not Done in the configured project.'
+          [[ "$done_in_project" == true ]] || reject_ineligible 'Issue is not Done in the configured project.'
 
           # Recheck after the project request: ownership/closure can change independently.
           issue=$(api "$issue_path")
-          printf '%s' "$issue" | eligible || reject_ineligible 'Feature eligibility changed.'
+          printf '%s' "$issue" | eligible || reject_ineligible 'Issue eligibility changed.'
           comments=$(api --paginate --slurp "$issue_path/comments?per_page=100" | jq 'add')
           marker='<!-- feature-ready-to-ship-to-production -->'
           sent='<!-- feature-ready-slack-sent -->'
           pending='<!-- feature-ready-slack-pending -->'
           comment=$(printf '%s' "$comments" | jq -c --arg marker "$marker" '
             [.[] | select((.user.login == "ecoscope-elebot" or .user.login == "github-actions[bot]") and
-            (.body | startswith($marker)))] | if length > 1 then error("Duplicate feature comments") else .[0] end')
+            (.body | startswith($marker)))] | if length > 1 then error("Duplicate ready-to-ship comments") else .[0] end')
+          kind=$(printf '%s' "$issue" | jq -er '.type | if type == "object" then .name else . end')
+          if [[ "$kind" == Bug ]]; then
+            reminder="This bug is officially \`Done\`! 🎉 One less bug, one happier user. Please land it on production ASAP. 🚀"
+          else
+            reminder="This feature is officially \`Done\`! 🎉 A feature shipped is a feature earned. Please land it on production ASAP. 🚀"
+          fi
           if [[ "$comment" == null ]]; then
-            payload=$(printf '%s' "$issue" | jq --arg marker "$marker" '{body:
-              ($marker + "\n**Feature: " + .title + "**\n\n" +
+            payload=$(printf '%s' "$issue" | jq --arg marker "$marker" --arg kind "$kind" --arg reminder "$reminder" '{body:
+              ($marker + "\n**" + $kind + ": " + .title + "**\n\n" +
               ([.assignees[].login | "@" + .] | join(" ")) +
-              " This feature is officially `Done`! 🎉 A feature shipped is a feature earned. Please land it on production ASAP. 🚀")
+              " " + $reminder)
             }')
             comment=$(printf '%s' "$payload" | api --method POST "$issue_path/comments" --input -)
           fi
           if printf '%s' "$comment" | jq -e --arg sent "$sent" '
             (.body | contains($sent)) or (.body | contains("<!-- feature-ready-slack-dispatched -->"))
           ' >/dev/null; then
-            echo 'Feature reminder already delivered or dispatched; preserving its metadata.'
+            echo 'Ready-to-ship reminder already delivered or dispatched; preserving its metadata.'
             exit 0
           fi
           if printf '%s' "$comment" | jq -e --arg pending "$pending" '.body | contains($pending)' >/dev/null; then
@@ -169,9 +176,9 @@ jobs:
           mentions=$(printf '%s' "$issue" | jq -er --argjson members "$members" '
             [.assignees[].login | ascii_downcase | . as $login |
               $members[$login] // error("Missing Slack mapping for " + $login) | "<@" + . + ">"] | join(" ")')
-          message=$(printf '%s' "$issue" | jq -r --arg mentions "$mentions" '
-            "*Feature: " + (.title | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;")) +
-            "*\n\n" + $mentions + " This feature is officially `Done`! 🎉 A feature shipped is a feature earned. Please land it on production ASAP. 🚀"')
+          message=$(printf '%s' "$issue" | jq -r --arg mentions "$mentions" --arg kind "$kind" --arg reminder "$reminder" '
+            "*" + $kind + ": " + (.title | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;")) +
+            "*\n\n" + $mentions + " " + $reminder')
           comment_id=$(printf '%s' "$comment" | jq -er '.id')
           comment_url=$(printf '%s' "$comment" | jq -er '.html_url')
           comment_path="repos/$SOURCE_REPOSITORY/issues/comments/$comment_id"
@@ -208,4 +215,4 @@ jobs:
           printf '%s' "$current" | jq --arg pending "$pending" --arg sent "$sent" --arg block "$block" '
             {body: ((.body | split("\n"+$pending) | join("")) + "\n" + $sent + "\n\n" + $block)}' |
             api --method PATCH "$comment_path" --input - --silent
-          echo 'Feature owners notified; original Slack channel/thread saved in the hidden comment.'
+          echo 'Issue owners notified; original Slack channel/thread saved in the hidden comment.'

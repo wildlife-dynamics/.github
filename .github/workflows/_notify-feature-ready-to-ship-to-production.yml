@@ -1,4 +1,4 @@
-# Dispatches feature notifications to a separate run in .github.
+# Dispatches Feature and Bug notifications to a separate run in .github.
 # Project reads, issue comments, and Slack delivery use .github's own secrets.
 #
 # Inputs:
@@ -11,7 +11,7 @@
 #
 # Example caller:
 #
-# name: Notify feature owners that Feature is ready to ship
+# name: Notify owners that a Feature or Bug is ready to ship
 # on:
 #   issues:
 #     types: [closed]
@@ -24,7 +24,7 @@
 #     secrets:
 #       DISPATCH_TOKEN: ${{ secrets.ECOSCOPE_ELEBOT_PAT }}
 
-name: Request feature shipment notification
+name: Request Feature or Bug shipment notification
 
 on:
   workflow_call:
@@ -87,22 +87,17 @@ jobs:
             }
 
             const ref = process.env.NOTIFICATION_WORKFLOW_REF || "main";
-            const preMergeTest = ref !== "main";
-            // Before merge, the registered checks workflow calls the new
-            // notification workflow from the same .github branch.
+            // The central workflow is registered on main; ref selects its tested branch.
             const { data } = await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: ".github",
-              workflow_id: preMergeTest
-                ? "pull_request_checks.yml"
-                : "notify-feature-ready-to-ship-to-production.yml",
+              workflow_id: "notify-feature-ready-to-ship-to-production.yml",
               ref,
               inputs: {
                 repository: `${context.repo.owner}/${context.repo.repo}`,
                 issue_number: String(issueNumber),
                 project_number: String(projectNumber),
-                fail_if_ineligible: String(manualTest),
-                ...(preMergeTest ? { notify_feature: "true" } : {})
+                fail_if_ineligible: String(manualTest)
               }
             });
-            core.info(`Feature notification queued in .github${data?.html_url ? `: ${data.html_url}` : "."}`);
+            core.info(`Shipment notification queued in .github${data?.html_url ? `: ${data.html_url}` : "."}`);
