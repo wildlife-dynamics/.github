@@ -1,0 +1,186 @@
+# Delivery only: callers supply the complete text, recipients, issue, and stable delivery marker.
+name: Deliver a feature message to GitHub and Slack
+run-name: Feature notification for run ${{ inputs.source_run_id }} attempt ${{ inputs.source_run_attempt }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Trusted Compose workflow run containing the prepared messages
+        type: string
+        required: true
+      source_run_attempt:
+        description: Run attempt containing the notification artifact
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  # Serialize delivery so two retries cannot send the same unconfirmed message concurrently.
+  group: central-compose-promotion-notifications
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.ECOSCOPE_ELEBOT_PAT }}
+      SLACK_BOT_TOKEN: ${{ secrets.FEATURE_READY_SLACK_BOT_TOKEN }}
+      SLACK_MEMBERS: ${{ vars.GH_USERNAME_TO_SLACK_MEMBER_ID }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+    steps:
+      - name: Verify the message artifact and deliver supplied notifications
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          repo=wildlife-dynamics/compose
+          endpoint="repos/$repo"
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          api() { gh api -H 'X-GitHub-Api-Version: 2022-11-28' "$@"; }
+          fail() { echo "::error::$*" >&2; return 1; }
+          thread_metadata() {
+            jq -ce '
+              [.[] | select((.user.login == "ecoscope-elebot" or .user.login == "github-actions[bot]") and
+                (.body | startswith("<!-- feature-ready-to-ship-to-production -->"))) |
+                .body | scan("<!-- feature-slack-thread:v1\\s*([\\s\\S]*?)\\s*-->") | .[0] | fromjson] |
+              if length != 1 then error("Expected one trusted feature Slack thread") else .[0] end |
+              if (.channel_id | type == "string" and test("^[CG][A-Z0-9]+$")) and
+                 (.thread_ts | type == "string" and test("^[0-9]+\\.[0-9]+$"))
+              then {channel_id,thread_ts} else error("Invalid saved Slack thread") end'
+          }
+          slack_mentions() {
+            jq -er --argjson users "$1" '
+              if type != "object" then error("Expected GitHub-to-Slack map") else
+                with_entries(.key |= ascii_downcase) as $members |
+                [$users[] | ascii_downcase | . as $login |
+                  $members[$login] // error("Missing Slack mapping for " + $login) |
+                  if type == "string" and test("^[UW][A-Z0-9]+$") then "<@" + . + ">"
+                  else error("Invalid Slack member ID") end] | unique | join(" ") end'
+          }
+          deliver() {
+            local notification number marker github_text slack_text slack_users issue comments comment mentions
+            local metadata id path payload status current state reply feature_failed failures=0
+            while IFS= read -r notification; do
+              number=$(printf '%s' "$notification" | jq -er .issue_number)
+              marker=$(printf '%s' "$notification" | jq -er .marker)
+              github_text=$(printf '%s' "$notification" | jq -er .github_text)
+              slack_text=$(printf '%s' "$notification" | jq -er .slack_text)
+              slack_users=$(printf '%s' "$notification" | jq -ce .slack_users)
+              feature_failed=false
+              # The caller selects the issue and people; never turn a PR into an issue-comment target.
+              issue=$(api "$endpoint/issues/$number") || { failures=1; continue; }
+              printf '%s' "$issue" | jq -e '.pull_request == null' >/dev/null || { failures=1; continue; }
+              # Retain legacy delivery markers so confirmed messages remain deduplicated after upgrades.
+              comments=$(api --paginate --slurp "$endpoint/issues/$number/comments?per_page=100" | jq add) || { failures=1; continue; }
+              comment=$(printf '%s' "$comments" | jq -c --arg marker "$marker" '
+                [.[] | select(.user.login == "ecoscope-elebot" and (.body | startswith($marker)))] |
+                if length > 1 then error("Duplicate notification comments") else .[0] end') || { failures=1; continue; }
+              if [[ "$comment" == null ]]; then
+                payload=$(jq -n --arg body "$marker"$'\n'"$github_text" '{body:$body}')
+                comment=$(printf '%s' "$payload" | api --method POST "$endpoint/issues/$number/comments" --input -) || { failures=1; continue; }
+              fi
+              if printf '%s' "$comment" | jq -e '.body | contains("<!-- promotion-slack-sent:")' >/dev/null; then continue; fi
+              if printf '%s' "$comment" | jq -e '.body | contains("<!-- promotion-slack-pending -->")' >/dev/null; then
+                fail "Feature #$number has ambiguous Slack delivery; verify manually before clearing its pending marker." || true
+                failures=1
+                continue
+              fi
+              metadata=$(printf '%s' "$comments" | thread_metadata) || feature_failed=true
+              mentions=$(printf '%s' "$SLACK_MEMBERS" | slack_mentions "$slack_users") || feature_failed=true
+              if [[ "$feature_failed" == true || -z "$SLACK_BOT_TOKEN" ]]; then
+                fail "Feature #$number needs valid saved thread metadata, Slack mapping, and bot credentials." || true
+                failures=1
+                continue
+              fi
+              id=$(printf '%s' "$comment" | jq -er .id)
+              path="$endpoint/issues/comments/$id"
+              printf '%s' "$comment" | jq '{body:(.body + "\n<!-- promotion-slack-pending -->")}' |
+                api --method PATCH "$path" --input - --silent || { failures=1; continue; }
+              payload=$(printf '%s' "$metadata" | jq --arg text "$mentions $slack_text" '
+                {channel:.channel_id,thread_ts:.thread_ts,text:$text,unfurl_links:false,unfurl_media:false,
+                 blocks:[{type:"section",text:{type:"mrkdwn",text:$text,verbatim:true}}]}')
+              if ! status=$(curl --silent --show-error --max-time 30 --output "$work/slack" --write-out '%{http_code}' \
+                -H "Authorization: Bearer $SLACK_BOT_TOKEN" -H 'Content-Type: application/json' \
+                --data-binary "$payload" https://slack.com/api/chat.postMessage); then
+                fail "Feature #$number Slack delivery is ambiguous; verify before retrying." || true
+                failures=1
+                continue
+              fi
+              if [[ "$status" != 200 ]] || ! jq -e '.ok == true' "$work/slack" >/dev/null; then
+                if [[ "$status" =~ ^4[0-9][0-9]$ ]] || { [[ "$status" == 200 ]] && jq -e '.ok == false' "$work/slack" >/dev/null; }; then
+                  current=$(api "$path") || { failures=1; continue; }
+                  printf '%s' "$current" | jq '{body:(.body | split("\n<!-- promotion-slack-pending -->") | join(""))}' |
+                    api --method PATCH "$path" --input - --silent || true
+                fi
+                jq -c '{error,needed,provided}' "$work/slack" >&2 || true
+                fail "Feature #$number Slack request failed (HTTP $status). Inspect its delivery marker before retrying." || true
+                failures=1
+                continue
+              fi
+              reply=$(jq -ce --argjson saved "$metadata" '
+                if .channel == $saved.channel_id and .message.thread_ts == $saved.thread_ts and
+                  (.ts | type == "string" and test("^[0-9]+\\.[0-9]+$"))
+                then {channel_id:.channel,thread_ts:$saved.thread_ts,reply_ts:.ts}
+                else error("Invalid Slack reply identity") end' "$work/slack") || { failures=1; continue; }
+              state=$(printf '%s' "$notification" | jq -c --argjson reply "$reply" '.metadata + $reply')
+              current=$(api "$path") || { failures=1; continue; }
+              printf '%s' "$current" | jq --arg state "$state" '
+                {body:((.body | split("\n<!-- promotion-slack-pending -->") | join("")) + "\n<!-- promotion-slack-sent:" + $state + " -->")}' |
+                api --method PATCH "$path" --input - --silent || { failures=1; continue; }
+            done < <(jq -c '.notifications[]' "$work/messages.json")
+            return "$failures"
+          }
+
+          [[ "$GITHUB_REPOSITORY" == wildlife-dynamics/.github && "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$GITHUB_REF" == refs/heads/main ]]
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ && "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ $(api user --jq '.login | ascii_downcase') == ecoscope-elebot ]]
+
+          # Trust only the current attempt of the allowlisted Compose workflow on main.
+          # This verifies who supplied the messages; it does not decide what the release status means.
+          for ((wait_count=0; wait_count<30; wait_count++)); do
+            source_run=$(api "$endpoint/actions/runs/$SOURCE_RUN_ID/attempts/$SOURCE_RUN_ATTEMPT")
+            [[ $(printf '%s' "$source_run" | jq -r .status) == completed ]] && break
+            sleep 10
+          done
+          printf '%s' "$source_run" | jq -e --arg repo "$repo" --argjson attempt "$SOURCE_RUN_ATTEMPT" '
+            .repository.full_name == $repo and .path == ".github/workflows/promote-stage-to-prod.yml" and
+            .event == "workflow_dispatch" and .head_branch == "main" and .run_attempt == $attempt and
+            .status == "completed" and (.conclusion == "success" or .conclusion == "failure")' >/dev/null
+          [[ $(api "$endpoint/actions/runs/$SOURCE_RUN_ID" --jq .run_attempt) == "$SOURCE_RUN_ATTEMPT" ]]
+          head_sha=$(printf '%s' "$source_run" | jq -er .head_sha)
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
+          api "$endpoint/compare/$head_sha...main" --jq .status |
+            { read -r status; [[ "$status" == ahead || "$status" == identical ]]; }
+          # Require the upload to have completed even when the caller is reporting its own failure.
+          api --paginate --slurp "$endpoint/actions/runs/$SOURCE_RUN_ID/attempts/$SOURCE_RUN_ATTEMPT/jobs?per_page=100" |
+            jq -e 'any(.[].jobs[]; any(.steps[]; .name == "Save feature notifications" and .conclusion == "success"))' >/dev/null
+          artifact=$(api --paginate --slurp "$endpoint/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" |
+            jq -ce --arg name "feature-notifications-$SOURCE_RUN_ATTEMPT" --argjson run "$SOURCE_RUN_ID" --arg sha "$head_sha" '
+              [.[].artifacts[] | select(.name == $name)] |
+              if length == 1 then .[0] else error("Expected exactly one notification artifact") end |
+              select(.expired == false and .workflow_run.id == $run and .workflow_run.head_sha == $sha and
+                (.id|type == "number" and . > 0) and .size_in_bytes > 0 and .size_in_bytes <= 1048576)')
+          artifact_id=$(printf '%s' "$artifact" | jq -er .id)
+          api "$endpoint/actions/artifacts/$artifact_id/zip" > "$work/messages.zip"
+          # Read only the expected JSON member. Never extract paths or execute artifact-supplied content.
+          unzip -p "$work/messages.zip" feature-notifications.json > "$work/messages.json"
+          jq -e --arg repo "$repo" --arg run "$SOURCE_RUN_ID" --arg attempt "$SOURCE_RUN_ATTEMPT" '
+            .version == 1 and .repository == $repo and .source_run_id == $run and .source_run_attempt == $attempt and
+            (.notifications | type == "array" and length > 0 and length <= 50 and
+              (unique_by([.issue_number,.marker]) | length) == length and all(.[];
+                (.issue_number | type == "string" and test("^[1-9][0-9]*$")) and
+                (.marker | type == "string" and test("^<!-- [A-Za-z0-9][A-Za-z0-9 _:=.-]{0,500} -->$")) and
+                (.github_text | type == "string" and length > 0 and length <= 60000 and (contains("<!--") | not)) and
+                (.slack_text | type == "string" and length > 0 and length <= 2500) and
+                (.slack_users | type == "array" and length > 0 and length <= 25 and all(.[];
+                  type == "string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$"))) and
+                (.metadata | type == "object" and (tojson | length <= 5000 and (contains("-->") | not)))))' \
+            "$work/messages.json" >/dev/null
+          deliver
+          echo 'Supplied notifications delivered or already confirmed.'
