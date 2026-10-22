@@ -148,9 +148,9 @@ jobs:
             (.body | startswith($marker)))] | if length > 1 then error("Duplicate ready-to-ship comments") else .[0] end')
           kind=$(printf '%s' "$issue" | jq -er '.type | if type == "object" then .name else . end')
           if [[ "$kind" == Bug ]]; then
-            reminder='This bug is officially `Done`! 🎉 One less bug, one happier user. Please land it on production ASAP. 🚀'
+            reminder="This bug is officially \`Done\`! 🎉 One less bug, one happier user. Please land it on production ASAP. 🚀"
           else
-            reminder='This feature is officially `Done`! 🎉 A feature shipped is a feature earned. Please land it on production ASAP. 🚀'
+            reminder="This feature is officially \`Done\`! 🎉 A feature shipped is a feature earned. Please land it on production ASAP. 🚀"
           fi
           if [[ "$comment" == null ]]; then
             payload=$(printf '%s' "$issue" | jq --arg marker "$marker" --arg kind "$kind" --arg reminder "$reminder" '{body:
