@@ -54,9 +54,12 @@ GitHub mentions. Both messages include a bold ticket type and title.
 
 Set `FEATURE_READY_SLACK_CHANNEL_ID` to the destination for new threads. Existing
 threads retain the channel and thread ID saved in their hidden GitHub comment.
-Feature reminders retain their existing wording. Bug reminders say:
-
-> This bug is officially `Done`! 🎉 One less bug, one happier user. Please land it on production ASAP. 🚀
+Compose owns the Feature and Bug reminder text in
+[`.github/ready-to-ship-messages.json`](https://github.com/wildlife-dynamics/compose/blob/main/.github/ready-to-ship-messages.json).
+Delivery reads that file from Compose `main` for every caller, including Web,
+and adds the ticket title, owner mentions, and platform-specific formatting.
+Merge the message file into Compose before merging this consumer change.
+Missing or invalid text stops delivery before a comment or Slack message is posted.
 
 All assignees are mentioned in one comment. A hidden marker prevents duplicate
 comments; another records successful Slack delivery. If Slack fails, rerun the
