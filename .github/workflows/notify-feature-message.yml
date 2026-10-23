@@ -1,6 +1,6 @@
 # Delivery only: callers supply the complete text, recipients, issue, and stable delivery marker.
-name: Deliver a feature message to GitHub and Slack
-run-name: Feature notification for run ${{ inputs.source_run_id }} attempt ${{ inputs.source_run_attempt }}
+name: Deliver a Feature or Bug message to GitHub and Slack
+run-name: Issue notification for run ${{ inputs.source_run_id }} attempt ${{ inputs.source_run_attempt }}
 
 on:
   workflow_dispatch:
@@ -53,7 +53,7 @@ jobs:
               [.[] | select((.user.login == "ecoscope-elebot" or .user.login == "github-actions[bot]") and
                 (.body | startswith("<!-- feature-ready-to-ship-to-production -->"))) |
                 .body | scan("<!-- feature-slack-thread:v1\\s*([\\s\\S]*?)\\s*-->") | .[0] | fromjson] |
-              if length != 1 then error("Expected one trusted feature Slack thread") else .[0] end |
+              if length != 1 then error("Expected one trusted issue Slack thread") else .[0] end |
               if (.channel_id | type == "string" and test("^[CG][A-Z0-9]+$")) and
                  (.thread_ts | type == "string" and test("^[0-9]+\\.[0-9]+$"))
               then {channel_id,thread_ts} else error("Invalid saved Slack thread") end'
@@ -101,15 +101,15 @@ jobs:
               # Pending means an earlier send may have succeeded before its receipt could be recorded.
               # Stop rather than automatically sending a second ping; a human must verify that case.
               if printf '%s' "$comment" | jq -e '.body | contains("<!-- promotion-slack-pending -->")' >/dev/null; then
-                fail "Feature #$number has ambiguous Slack delivery; verify manually before clearing its pending marker." || true
+                fail "Issue #$number has ambiguous Slack delivery; verify manually before clearing its pending marker." || true
                 failures=1
                 continue
               fi
-              # Always reuse the saved thread, even if the configured channel for new features changes.
+              # Always reuse the saved thread, even if the configured channel for new issues changes.
               metadata=$(printf '%s' "$comments" | thread_metadata) || feature_failed=true
               mentions=$(printf '%s' "$SLACK_MEMBERS" | slack_mentions "$slack_users") || feature_failed=true
               if [[ "$feature_failed" == true || -z "$SLACK_BOT_TOKEN" ]]; then
-                fail "Feature #$number needs valid saved thread metadata, Slack mapping, and bot credentials." || true
+                fail "Issue #$number needs valid saved thread metadata, Slack mapping, and bot credentials." || true
                 failures=1
                 continue
               fi
@@ -127,7 +127,7 @@ jobs:
                 -H "Authorization: Bearer $SLACK_BOT_TOKEN" -H 'Content-Type: application/json' \
                 --data-binary "$payload" https://slack.com/api/chat.postMessage); then
                 # Preserve pending when the network result is uncertain; retrying could duplicate delivery.
-                fail "Feature #$number Slack delivery is ambiguous; verify before retrying." || true
+                fail "Issue #$number Slack delivery is ambiguous; verify before retrying." || true
                 failures=1
                 continue
               fi
@@ -140,7 +140,7 @@ jobs:
                     api --method PATCH "$path" --input - --silent || true
                 fi
                 jq -c '{error,needed,provided}' "$work/slack" >&2 || true
-                fail "Feature #$number Slack request failed (HTTP $status). Inspect its delivery marker before retrying." || true
+                fail "Issue #$number Slack request failed (HTTP $status). Inspect its delivery marker before retrying." || true
                 failures=1
                 continue
               fi
@@ -167,24 +167,28 @@ jobs:
           [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ && "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
           [[ $(api user --jq '.login | ascii_downcase') == ecoscope-elebot ]]
 
-          # Trust only the current attempt of the allowlisted Compose workflow on main.
-          # This verifies who supplied the messages; it does not decide what the release status means.
-          # Dispatch happens before the caller exits; wait for its final result before reading its artifact.
+          # Accept the current attempt of an allowlisted Compose entry point.
+          # Wait for the producer to finish uploading before consuming its artifact.
           for ((wait_count=0; wait_count<30; wait_count++)); do
             source_run=$(api "$endpoint/actions/runs/$SOURCE_RUN_ID/attempts/$SOURCE_RUN_ATTEMPT")
             [[ $(printf '%s' "$source_run" | jq -r .status) == completed ]] && break
             sleep 10
           done
           printf '%s' "$source_run" | jq -e --arg repo "$repo" --argjson attempt "$SOURCE_RUN_ATTEMPT" '
-            .repository.full_name == $repo and .path == ".github/workflows/promote-stage-to-prod.yml" and
-            .event == "workflow_dispatch" and .head_branch == "main" and .run_attempt == $attempt and
-            .status == "completed" and (.conclusion == "success" or .conclusion == "failure")' >/dev/null
-          # A newer attempt supersedes this request. Also prove the workflow revision belongs to Compose main.
+            .repository.full_name == $repo and .run_attempt == $attempt and .status == "completed" and
+            (.conclusion == "success" or .conclusion == "failure" or .conclusion == "cancelled") and (
+              (.path == ".github/workflows/promote-stage-to-prod.yml" and .event == "workflow_dispatch" and .head_branch == "main") or
+              ((.path == ".github/workflows/stage.yaml" or .path == ".github/workflows/prod.yaml") and .event == "pull_request")
+            )' >/dev/null
           [[ $(api "$endpoint/actions/runs/$SOURCE_RUN_ID" --jq .run_attempt) == "$SOURCE_RUN_ATTEMPT" ]]
           head_sha=$(printf '%s' "$source_run" | jq -er .head_sha)
           [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
-          api "$endpoint/compare/$head_sha...main" --jq .status |
-            { read -r status; [[ "$status" == ahead || "$status" == identical ]]; }
+          source_path=$(printf '%s' "$source_run" | jq -er .path)
+          # Keep the old dispatcher valid while the new stage workflow is being rolled out.
+          if [[ "$source_path" == .github/workflows/promote-stage-to-prod.yml ]]; then
+            api "$endpoint/compare/$head_sha...main" --jq .status |
+              { read -r status; [[ "$status" == ahead || "$status" == identical ]]; }
+          fi
           # Require the upload to have completed even when the caller is reporting its own failure.
           api --paginate --slurp "$endpoint/actions/runs/$SOURCE_RUN_ID/attempts/$SOURCE_RUN_ATTEMPT/jobs?per_page=100" |
             jq -e 'any(.[].jobs[]; any(.steps[]; .name == "Save feature notifications" and .conclusion == "success"))' >/dev/null
@@ -214,6 +218,35 @@ jobs:
                   type == "string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$"))) and
                 (.metadata | type == "object" and (tojson | length <= 5000 and (contains("-->") | not)))))' \
             "$work/messages.json" >/dev/null
+          if [[ "$source_path" != .github/workflows/promote-stage-to-prod.yml ]]; then
+            if [[ "$source_path" == .github/workflows/prod.yaml ]]; then
+              target=prod
+              pr=$(jq -er '.production_pr | select(type == "string" and test("^[1-9][0-9]*$"))' "$work/messages.json")
+              merge_sha=$(jq -er '.production_sha' "$work/messages.json")
+              jq -e --arg run "$SOURCE_RUN_ID" --arg attempt "$SOURCE_RUN_ATTEMPT" '
+                .production_run_id == $run and .production_run_attempt == $attempt' "$work/messages.json" >/dev/null
+            else
+              target=stage
+              pr=$(jq -er '.source_pr | select(type == "string" and test("^[1-9][0-9]*$"))' "$work/messages.json")
+              merge_sha=$(jq -er '.stage_sha' "$work/messages.json")
+              jq -e --arg run "$SOURCE_RUN_ID" --arg attempt "$SOURCE_RUN_ATTEMPT" '
+                .stage_run_id == $run and .stage_run_attempt == $attempt' "$work/messages.json" >/dev/null
+            fi
+            [[ "$merge_sha" =~ ^[0-9a-f]{40}$ ]]
+            # PR runs identify their source branch, not the merge commit. Bind both to a
+            # same-repository merged PR and prove its merge remains in the target history.
+            api "$endpoint/pulls/$pr" | jq -e --arg repo "$repo" --arg target "$target" \
+              --arg merge "$merge_sha" --argjson run "$source_run" '
+                .merged == true and .base.ref == $target and .base.repo.full_name == $repo and
+                .head.repo.full_name == $repo and .head.sha == $run.head_sha and .head.ref == $run.head_branch and
+                .merge_commit_sha == $merge and
+                (($run.created_at | fromdateiso8601) >= (.merged_at | fromdateiso8601)) and
+                (($run.created_at | fromdateiso8601) <= ((.merged_at | fromdateiso8601) + 600))' >/dev/null
+            api "$endpoint/compare/$merge_sha...$target" --jq .status |
+              { read -r status; [[ "$status" == ahead || "$status" == identical ]]; }
+          fi
+          # Recheck freshness after downloading and validating the artifact, immediately before writes.
+          [[ $(api "$endpoint/actions/runs/$SOURCE_RUN_ID" --jq .run_attempt) == "$SOURCE_RUN_ATTEMPT" ]]
           # Only verified caller-supplied messages reach GitHub and Slack. Delivery markers handle retries.
           deliver
           echo 'Supplied notifications delivered or already confirmed.'
