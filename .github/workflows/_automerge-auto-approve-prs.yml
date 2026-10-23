@@ -15,6 +15,8 @@
 #     `ecoscope-elebot`. The `automerge` label and non-draft conditions still apply.
 #   `pull_request_head_sha` (optional, string, default ``): Head commit the caller inspected. When
 #     set, nothing is approved or enabled unless the pull request head still matches it.
+#   `auto_approve_reason` (optional, string, default ``): Why the caller marked the pull request
+#     eligible for `auto_approve`, shown in the approval and automerge messages. Markdown, one line.
 #
 # Secrets:
 #   `PAT` (required): Bot token with permission to merge in the calling repository.
@@ -62,6 +64,11 @@ on:
         default: false
       pull_request_head_sha:
         description: Head commit the caller inspected. When set, approval and auto-merge only happen if the pull request head still matches it.
+        type: string
+        required: false
+        default: ""
+      auto_approve_reason:
+        description: Why the caller marked the pull request eligible for `auto_approve` (one line of Markdown). Shown in the approval and automerge messages.
         type: string
         required: false
         default: ""
@@ -123,7 +130,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           issue-number: ${{ github.event.pull_request.number }}
           body: |
-            ℹ️ @${{ inputs.pull_request_author_github_username }} this PR qualifies for automatic approval, so I have enabled automerge on it. It will merge automatically once the required checks pass. If it stops qualifying, the automatic approval and automerge are withdrawn.
+            ℹ️ @${{ inputs.pull_request_author_github_username }} this PR qualifies for automatic approval${{ inputs.auto_approve_reason != '' && format(' ({0})', inputs.auto_approve_reason) || '' }}, so I have enabled automerge on it. It will merge automatically once the required checks pass. If it stops qualifying, the automatic approval and automerge are withdrawn.
 
   auto-approve-elebot-updates:
     name: Auto-approve elebot PRs
@@ -140,6 +147,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EXPECTED_HEAD_SHA: ${{ inputs.pull_request_head_sha }}
           AUTHOR: ${{ inputs.pull_request_author_github_username }}
+          REASON: ${{ inputs.auto_approve_reason }}
           APPROVAL_MARKER: "<!-- wildlife-dynamics/.github:automerge-auto-approve -->"
         run: |
           set -euo pipefail
@@ -156,6 +164,8 @@ jobs:
           fi
           if [ "$AUTHOR" = "ecoscope-elebot" ]; then
             body="✅ Auto-approved ecoscope-elebot PR."
+          elif [ -n "$REASON" ]; then
+            body=$(printf '✅ Auto-approved: %s\n\n%s' "$REASON" "$APPROVAL_MARKER")
           else
             body=$(printf '✅ Auto-approved: the calling workflow marked this PR as eligible.\n\n%s' "$APPROVAL_MARKER")
           fi
