@@ -47,14 +47,18 @@ jobs:
           api() { gh api -H 'X-GitHub-Api-Version: 2022-11-28' "$@"; }
           fail() { echo "::error::$*" >&2; return 1; }
           # Recover the original channel/thread from the feature-ready bot comment's hidden JSON.
-          # Require exactly one trusted record; guessing between threads could notify the wrong people.
+          # No record means this issue never had a Slack thread, so its notification is skipped.
+          # Multiple records remain an error: guessing between threads could notify the wrong people.
           thread_metadata() {
-            jq -ce '
+            jq -c '
               [.[] | select((.user.login == "ecoscope-elebot" or .user.login == "github-actions[bot]") and
                 (.body | startswith("<!-- feature-ready-to-ship-to-production -->"))) |
                 .body | scan("<!-- feature-slack-thread:v1\\s*([\\s\\S]*?)\\s*-->") | .[0] | fromjson] |
-              if length != 1 then error("Expected one trusted issue Slack thread") else .[0] end |
-              if (.channel_id | type == "string" and test("^[CG][A-Z0-9]+$")) and
+              if length == 0 then null
+              elif length == 1 then .[0]
+              else error("Expected at most one trusted issue Slack thread") end |
+              if . == null then .
+              elif (.channel_id | type == "string" and test("^[CG][A-Z0-9]+$")) and
                  (.thread_ts | type == "string" and test("^[0-9]+\\.[0-9]+$"))
               then {channel_id,thread_ts} else error("Invalid saved Slack thread") end'
           }
@@ -71,7 +75,7 @@ jobs:
           }
           deliver() {
             local notification number marker github_text slack_text slack_users issue comments comment mentions
-            local metadata id path payload status current state reply feature_failed failures=0
+            local metadata id path payload status current state reply feature_failed failures=0 threaded=0
             # Read each prepared notification as JSON data. No message text is evaluated as shell code.
             # A failed delivery should not prevent attempts for other issues; fail the run afterward.
             while IFS= read -r notification; do
@@ -91,27 +95,37 @@ jobs:
               comment=$(printf '%s' "$comments" | jq -c --arg marker "$marker" '
                 [.[] | select(.user.login == "ecoscope-elebot" and (.body | startswith($marker)))] |
                 if length > 1 then error("Duplicate notification comments") else .[0] end') || { failures=1; continue; }
-              if [[ "$comment" == null ]]; then
-                # Post the supplied GitHub wording once; later attempts reuse this same comment.
-                payload=$(jq -n --arg body "$marker"$'\n'"$github_text" '{body:$body}')
-                comment=$(printf '%s' "$payload" | api --method POST "$endpoint/issues/$number/comments" --input -) || { failures=1; continue; }
-              fi
               # A confirmed Slack receipt means the entire notification is already delivered.
-              if printf '%s' "$comment" | jq -e '.body | contains("<!-- promotion-slack-sent:")' >/dev/null; then continue; fi
+              if [[ "$comment" != null ]] &&
+                 printf '%s' "$comment" | jq -e '.body | contains("<!-- promotion-slack-sent:")' >/dev/null; then
+                threaded=$((threaded + 1))
+                continue
+              fi
               # Pending means an earlier send may have succeeded before its receipt could be recorded.
               # Stop rather than automatically sending a second ping; a human must verify that case.
-              if printf '%s' "$comment" | jq -e '.body | contains("<!-- promotion-slack-pending -->")' >/dev/null; then
+              if [[ "$comment" != null ]] &&
+                 printf '%s' "$comment" | jq -e '.body | contains("<!-- promotion-slack-pending -->")' >/dev/null; then
                 fail "Issue #$number has ambiguous Slack delivery; verify manually before clearing its pending marker." || true
                 failures=1
                 continue
               fi
               # Always reuse the saved thread, even if the configured channel for new issues changes.
               metadata=$(printf '%s' "$comments" | thread_metadata) || feature_failed=true
+              if [[ "$feature_failed" == false && "$metadata" == null ]]; then
+                echo "Issue #$number has no saved Slack thread; skipping its GitHub and Slack notification."
+                continue
+              fi
+              if [[ "$feature_failed" == false ]]; then threaded=$((threaded + 1)); fi
               mentions=$(printf '%s' "$SLACK_MEMBERS" | slack_mentions "$slack_users") || feature_failed=true
               if [[ "$feature_failed" == true || -z "$SLACK_BOT_TOKEN" ]]; then
                 fail "Issue #$number needs valid saved thread metadata, Slack mapping, and bot credentials." || true
                 failures=1
                 continue
+              fi
+              if [[ "$comment" == null ]]; then
+                # Post the supplied GitHub wording once; later attempts reuse this same comment.
+                payload=$(jq -n --arg body "$marker"$'\n'"$github_text" '{body:$body}')
+                comment=$(printf '%s' "$payload" | api --method POST "$endpoint/issues/$number/comments" --input -) || { failures=1; continue; }
               fi
               id=$(printf '%s' "$comment" | jq -er .id)
               path="$endpoint/issues/comments/$id"
@@ -158,6 +172,10 @@ jobs:
                 {body:((.body | split("\n<!-- promotion-slack-pending -->") | join("")) + "\n<!-- promotion-slack-sent:" + $state + " -->")}' |
                 api --method PATCH "$path" --input - --silent || { failures=1; continue; }
             done < <(jq -c '.notifications[]' "$work/messages.json")
+            if [[ "$threaded" == 0 ]]; then
+              fail 'None of the linked tickets has a saved Slack thread.' || true
+              return 1
+            fi
             return "$failures"
           }
 
