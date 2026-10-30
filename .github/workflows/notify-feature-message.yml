@@ -178,7 +178,9 @@ jobs:
             .repository.full_name == $repo and .run_attempt == $attempt and .status == "completed" and
             (.conclusion == "success" or .conclusion == "failure" or .conclusion == "cancelled") and (
               (.path == ".github/workflows/promote-stage-to-prod.yml" and .event == "workflow_dispatch" and .head_branch == "main") or
-              ((.path == ".github/workflows/stage.yaml" or .path == ".github/workflows/prod.yaml") and .event == "pull_request")
+              ((.path == ".github/workflows/dev-preview-deploy.yml" or
+                .path == ".github/workflows/stage.yaml" or
+                .path == ".github/workflows/prod.yaml") and .event == "pull_request")
             )' >/dev/null
           [[ $(api "$endpoint/actions/runs/$SOURCE_RUN_ID" --jq .run_attempt) == "$SOURCE_RUN_ATTEMPT" ]]
           head_sha=$(printf '%s' "$source_run" | jq -er .head_sha)
@@ -218,7 +220,10 @@ jobs:
                   type == "string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$"))) and
                 (.metadata | type == "object" and (tojson | length <= 5000 and (contains("-->") | not)))))' \
             "$work/messages.json" >/dev/null
-          if [[ "$source_path" != .github/workflows/promote-stage-to-prod.yml ]]; then
+          # Stage previews run before merge, so only post-merge stage/prod notifications
+          # can be bound to a merge commit in the target branch.
+          if [[ "$source_path" != .github/workflows/promote-stage-to-prod.yml &&
+                "$source_path" != .github/workflows/dev-preview-deploy.yml ]]; then
             if [[ "$source_path" == .github/workflows/prod.yaml ]]; then
               target=prod
               pr=$(jq -er '.production_pr | select(type == "string" and test("^[1-9][0-9]*$"))' "$work/messages.json")
