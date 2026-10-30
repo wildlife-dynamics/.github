@@ -75,7 +75,7 @@ jobs:
           }
           deliver() {
             local notification number marker github_text slack_text slack_users issue comments comment mentions
-            local metadata id path payload status current state reply feature_failed failures=0
+            local metadata id path payload status current state reply feature_failed failures=0 threaded=0
             # Read each prepared notification as JSON data. No message text is evaluated as shell code.
             # A failed delivery should not prevent attempts for other issues; fail the run afterward.
             while IFS= read -r notification; do
@@ -98,6 +98,7 @@ jobs:
               # A confirmed Slack receipt means the entire notification is already delivered.
               if [[ "$comment" != null ]] &&
                  printf '%s' "$comment" | jq -e '.body | contains("<!-- promotion-slack-sent:")' >/dev/null; then
+                threaded=$((threaded + 1))
                 continue
               fi
               # Pending means an earlier send may have succeeded before its receipt could be recorded.
@@ -114,6 +115,7 @@ jobs:
                 echo "Issue #$number has no saved Slack thread; skipping its GitHub and Slack notification."
                 continue
               fi
+              if [[ "$feature_failed" == false ]]; then threaded=$((threaded + 1)); fi
               mentions=$(printf '%s' "$SLACK_MEMBERS" | slack_mentions "$slack_users") || feature_failed=true
               if [[ "$feature_failed" == true || -z "$SLACK_BOT_TOKEN" ]]; then
                 fail "Issue #$number needs valid saved thread metadata, Slack mapping, and bot credentials." || true
@@ -170,6 +172,10 @@ jobs:
                 {body:((.body | split("\n<!-- promotion-slack-pending -->") | join("")) + "\n<!-- promotion-slack-sent:" + $state + " -->")}' |
                 api --method PATCH "$path" --input - --silent || { failures=1; continue; }
             done < <(jq -c '.notifications[]' "$work/messages.json")
+            if [[ "$threaded" == 0 ]]; then
+              fail 'None of the linked tickets has a saved Slack thread.' || true
+              return 1
+            fi
             return "$failures"
           }
 

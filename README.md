@@ -67,7 +67,8 @@ central job to retry Slack using the existing comment. An ambiguous Slack timeou
 or failure to save its receipt leaves a pending marker: verify delivery manually before clearing it. Automatic retries stop
 to avoid duplicate Slack messages. A linked Feature or Bug without a saved Slack
 thread is silently skipped on both platforms while notifications for other linked
-tickets continue. Changing project status after the closure run
+tickets continue. Delivery fails if none of the linked tickets has a saved Slack
+thread. Changing project status after the closure run
 finishes does not trigger a new notification.
 
 The central workflows must merge before callers reference the new reusable
