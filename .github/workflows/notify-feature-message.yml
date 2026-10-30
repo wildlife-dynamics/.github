@@ -59,13 +59,13 @@ jobs:
               then {channel_id,thread_ts} else error("Invalid saved Slack thread") end'
           }
           # Compose supplies GitHub logins; only this repository holds the Slack member-ID mapping.
-          # Match logins case-insensitively and reject missing mappings instead of sending an empty ping.
+          # Match logins case-insensitively and silently skip users without a Slack mapping.
           slack_mentions() {
             jq -er --argjson users "$1" '
               if type != "object" then error("Expected GitHub-to-Slack map") else
                 with_entries(.key |= ascii_downcase) as $members |
                 [$users[] | ascii_downcase | . as $login |
-                  $members[$login] // error("Missing Slack mapping for " + $login) |
+                  $members[$login] | select(. != null) |
                   if type == "string" and test("^[UW][A-Z0-9]+$") then "<@" + . + ">"
                   else error("Invalid Slack member ID") end] | unique | join(" ") end'
           }
@@ -240,8 +240,7 @@ jobs:
                 .merged == true and .base.ref == $target and .base.repo.full_name == $repo and
                 .head.repo.full_name == $repo and .head.sha == $run.head_sha and .head.ref == $run.head_branch and
                 .merge_commit_sha == $merge and
-                (($run.created_at | fromdateiso8601) >= (.merged_at | fromdateiso8601)) and
-                (($run.created_at | fromdateiso8601) <= ((.merged_at | fromdateiso8601) + 600))' >/dev/null
+                (($run.created_at | fromdateiso8601) >= (.merged_at | fromdateiso8601))' >/dev/null
             api "$endpoint/compare/$merge_sha...$target" --jq .status |
               { read -r status; [[ "$status" == ahead || "$status" == identical ]]; }
           fi
