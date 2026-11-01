@@ -98,6 +98,47 @@ names, and hidden markers retain their Feature-era names for compatibility.
 Stage promotion messages reuse the saved thread for either ticket type.
 Source workflow and artifact verification remain required.
 
+### Production-readiness notifications
+
+`notify-feature-message.yml` also accepts messages prepared by Compose's
+`production-pr-readiness.yml`. Deploy this support on `.github/main` before
+enabling that producer. Existing stage, preview, and production callers retain
+their current inputs, artifact names, and post-merge verification.
+
+The readiness caller supplies the existing run ID and attempt inputs plus
+`notification_phase`: `update-start`, `ready`, `changed-contents`,
+`merge-conflicts`, `checks-failed`, or `error`. Each phase uploads
+`feature-notifications-<attempt>-<phase>` with a successful step named
+`Save feature notifications (<phase>)`. The archive still contains only the
+expected `feature-notifications.json` member. Its envelope includes the existing
+repository/run/notification fields plus:
+
+```json
+{
+  "production_pr": "123",
+  "production_head_sha": "<the producer run's exact 40-character head SHA>",
+  "outcome": "update-start"
+}
+```
+
+The service accepts a completed upload checkpoint while the readiness producer
+is still running, allowing an update-start notice before readiness finishes.
+It verifies that the affected PR targets `prod` in Compose, belongs to the same
+repository, and still has the producer's exact head and branch. The
+`changed-contents` phase requires a closed, unmerged PR; every other phase
+requires an open, unmerged PR. Target freshness is rechecked before delivery.
+Feature-specific recipients and existing delivery markers continue to control
+mentions and duplicate prevention.
+
+Run the notification regression checks locally with:
+
+```sh
+python -B -m unittest discover -s tests -v
+```
+
+These checks execute the workflow's delivery script using local GitHub and
+Slack fixtures; they do not post real notifications.
+
 ### Automerge setup
 
 In each calling repository:

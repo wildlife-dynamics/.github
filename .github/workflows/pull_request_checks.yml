@@ -44,6 +44,23 @@ concurrency:
   cancel-in-progress: ${{ !inputs.notify_feature }}
 
 jobs:
+  feature-message-tests:
+    name: Test feature message delivery
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Run notification regression tests
+        run: python -B -m unittest discover -s tests -v
+
   notify-feature:
     if: github.event_name == 'workflow_dispatch' && inputs.notify_feature
     permissions: {}

@@ -13,6 +13,11 @@ on:
         description: Run attempt containing the notification artifact
         type: string
         required: true
+      notification_phase:
+        description: Readiness notification checkpoint; leave empty for existing producers
+        type: string
+        required: false
+        default: ""
 
 permissions: {}
 
@@ -32,6 +37,7 @@ jobs:
       SLACK_MEMBERS: ${{ vars.GH_USERNAME_TO_SLACK_MEMBER_ID }}
       SOURCE_RUN_ID: ${{ inputs.source_run_id }}
       SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+      NOTIFICATION_PHASE: ${{ inputs.notification_phase }}
     steps:
       - name: Verify the message artifact and deliver supplied notifications
         shell: bash
@@ -46,6 +52,18 @@ jobs:
           # Use one pinned API version for source verification and issue-comment operations.
           api() { gh api -H 'X-GitHub-Api-Version: 2022-11-28' "$@"; }
           fail() { echo "::error::$*" >&2; return 1; }
+          # A readiness notice follows one exact PR head, including while its producer is still running.
+          verify_readiness_target() {
+            [[ "${source_path:-}" == .github/workflows/production-pr-readiness.yml ]] || return 0
+            api "$endpoint/pulls/$readiness_pr" |
+              jq -e --arg repo "$repo" --arg head "$readiness_head" \
+                --arg phase "$NOTIFICATION_PHASE" --argjson run "$source_run" '
+                .base.ref == "prod" and .base.repo.full_name == $repo and
+                .head.repo.full_name == $repo and .head.sha == $head and
+                .head.sha == $run.head_sha and .head.ref == $run.head_branch and
+                (if $phase == "changed-contents" then .state == "closed" and .merged == false
+                 else .state == "open" and .merged == false end)' >/dev/null
+          }
           # Recover the original channel/thread from the feature-ready bot comment's hidden JSON.
           # No record means this issue never had a Slack thread, so its notification is skipped.
           # Multiple records remain an error: guessing between threads could notify the wrong people.
@@ -79,6 +97,7 @@ jobs:
             # Read each prepared notification as JSON data. No message text is evaluated as shell code.
             # A failed delivery should not prevent attempts for other issues; fail the run afterward.
             while IFS= read -r notification; do
+              verify_readiness_target || return 1
               number=$(printf '%s' "$notification" | jq -er .issue_number)
               marker=$(printf '%s' "$notification" | jq -er .marker)
               github_text=$(printf '%s' "$notification" | jq -er .github_text)
@@ -123,12 +142,14 @@ jobs:
                 continue
               fi
               if [[ "$comment" == null ]]; then
+                verify_readiness_target || return 1
                 # Post the supplied GitHub wording once; later attempts reuse this same comment.
                 payload=$(jq -n --arg body "$marker"$'\n'"$github_text" '{body:$body}')
                 comment=$(printf '%s' "$payload" | api --method POST "$endpoint/issues/$number/comments" --input -) || { failures=1; continue; }
               fi
               id=$(printf '%s' "$comment" | jq -er .id)
               path="$endpoint/issues/comments/$id"
+              verify_readiness_target || return 1
               # Record intent before sending: a timeout cannot prove whether Slack accepted the message.
               printf '%s' "$comment" | jq '{body:(.body + "\n<!-- promotion-slack-pending -->")}' |
                 api --method PATCH "$path" --input - --silent || { failures=1; continue; }
@@ -186,24 +207,40 @@ jobs:
           [[ $(api user --jq '.login | ascii_downcase') == ecoscope-elebot ]]
 
           # Accept the current attempt of an allowlisted Compose entry point.
-          # Wait for the producer to finish uploading before consuming its artifact.
+          # Existing producers finish first. Readiness can deliver a completed upload checkpoint early.
           for ((wait_count=0; wait_count<30; wait_count++)); do
             source_run=$(api "$endpoint/actions/runs/$SOURCE_RUN_ID/attempts/$SOURCE_RUN_ATTEMPT")
+            if [[ $(printf '%s' "$source_run" | jq -r .path) == .github/workflows/production-pr-readiness.yml &&
+                  $(printf '%s' "$source_run" | jq -r .status) == in_progress ]]; then break; fi
             [[ $(printf '%s' "$source_run" | jq -r .status) == completed ]] && break
             sleep 10
           done
           printf '%s' "$source_run" | jq -e --arg repo "$repo" --argjson attempt "$SOURCE_RUN_ATTEMPT" '
-            .repository.full_name == $repo and .run_attempt == $attempt and .status == "completed" and
-            (.conclusion == "success" or .conclusion == "failure" or .conclusion == "cancelled") and (
-              (.path == ".github/workflows/promote-stage-to-prod.yml" and .event == "workflow_dispatch" and .head_branch == "main") or
-              ((.path == ".github/workflows/stopgap-stage-preview-deploy.yml" or
-                .path == ".github/workflows/stage.yaml" or
-                .path == ".github/workflows/prod.yaml") and .event == "pull_request")
+            .repository.full_name == $repo and .run_attempt == $attempt and (
+              (.path == ".github/workflows/production-pr-readiness.yml" and
+                (.event == "pull_request" or .event == "workflow_dispatch") and
+                (.status == "in_progress" or (.status == "completed" and
+                  (.conclusion == "success" or .conclusion == "failure" or .conclusion == "cancelled")))) or
+              (.status == "completed" and
+                (.conclusion == "success" or .conclusion == "failure" or .conclusion == "cancelled") and (
+                  (.path == ".github/workflows/promote-stage-to-prod.yml" and .event == "workflow_dispatch" and .head_branch == "main") or
+                  ((.path == ".github/workflows/stopgap-stage-preview-deploy.yml" or
+                    .path == ".github/workflows/stage.yaml" or
+                    .path == ".github/workflows/prod.yaml") and .event == "pull_request")))
             )' >/dev/null
           [[ $(api "$endpoint/actions/runs/$SOURCE_RUN_ID" --jq .run_attempt) == "$SOURCE_RUN_ATTEMPT" ]]
           head_sha=$(printf '%s' "$source_run" | jq -er .head_sha)
           [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]
           source_path=$(printf '%s' "$source_run" | jq -er .path)
+          artifact_name="feature-notifications-$SOURCE_RUN_ATTEMPT"
+          upload_step='Save feature notifications'
+          if [[ "$source_path" == .github/workflows/production-pr-readiness.yml ]]; then
+            [[ "$NOTIFICATION_PHASE" =~ ^(update-start|ready|changed-contents|merge-conflicts|checks-failed|error)$ ]]
+            artifact_name+="-$NOTIFICATION_PHASE"
+            upload_step+=" ($NOTIFICATION_PHASE)"
+          else
+            [[ -z "$NOTIFICATION_PHASE" ]]
+          fi
           # Keep the old dispatcher valid while the new stage workflow is being rolled out.
           if [[ "$source_path" == .github/workflows/promote-stage-to-prod.yml ]]; then
             api "$endpoint/compare/$head_sha...main" --jq .status |
@@ -211,10 +248,11 @@ jobs:
           fi
           # Require the upload to have completed even when the caller is reporting its own failure.
           api --paginate --slurp "$endpoint/actions/runs/$SOURCE_RUN_ID/attempts/$SOURCE_RUN_ATTEMPT/jobs?per_page=100" |
-            jq -e 'any(.[].jobs[]; any(.steps[]; .name == "Save feature notifications" and .conclusion == "success"))' >/dev/null
+            jq -e --arg step "$upload_step" \
+              'any(.[].jobs[]; any(.steps[]; .name == $step and .conclusion == "success"))' >/dev/null
           # Bind one nonexpired, size-limited artifact to this exact run, attempt, and workflow revision.
           artifact=$(api --paginate --slurp "$endpoint/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" |
-            jq -ce --arg name "feature-notifications-$SOURCE_RUN_ATTEMPT" --argjson run "$SOURCE_RUN_ID" --arg sha "$head_sha" '
+            jq -ce --arg name "$artifact_name" --argjson run "$SOURCE_RUN_ID" --arg sha "$head_sha" '
               [.[].artifacts[] | select(.name == $name)] |
               if length == 1 then .[0] else error("Expected exactly one notification artifact") end |
               select(.expired == false and .workflow_run.id == $run and .workflow_run.head_sha == $sha and
@@ -240,7 +278,12 @@ jobs:
             "$work/messages.json" >/dev/null
           # Stage previews run before merge, so only post-merge stage/prod notifications
           # can be bound to a merge commit in the target branch.
-          if [[ "$source_path" != .github/workflows/promote-stage-to-prod.yml &&
+          if [[ "$source_path" == .github/workflows/production-pr-readiness.yml ]]; then
+            readiness_pr=$(jq -er '.production_pr | select(type == "string" and test("^[1-9][0-9]*$"))' "$work/messages.json")
+            readiness_head=$(jq -er '.production_head_sha | select(type == "string" and test("^[a-f0-9]{40}$"))' "$work/messages.json")
+            jq -e --arg phase "$NOTIFICATION_PHASE" '.outcome == $phase' "$work/messages.json" >/dev/null
+            verify_readiness_target
+          elif [[ "$source_path" != .github/workflows/promote-stage-to-prod.yml &&
                 "$source_path" != .github/workflows/stopgap-stage-preview-deploy.yml ]]; then
             if [[ "$source_path" == .github/workflows/prod.yaml ]]; then
               target=prod
@@ -269,6 +312,7 @@ jobs:
           fi
           # Recheck freshness after downloading and validating the artifact, immediately before writes.
           [[ $(api "$endpoint/actions/runs/$SOURCE_RUN_ID" --jq .run_attempt) == "$SOURCE_RUN_ATTEMPT" ]]
+          verify_readiness_target
           # Only verified caller-supplied messages reach GitHub and Slack. Delivery markers handle retries.
           deliver
           echo 'Supplied notifications delivered or already confirmed.'
