@@ -101,17 +101,14 @@ jobs:
               then {channel_id,thread_ts} else error("Invalid saved Slack thread") end'
           }
           # Compose supplies GitHub logins; only this repository holds the Slack member-ID mapping.
-          # New stage notices must not silently omit a human ticket assignee.
+          # Match logins case-insensitively and silently skip users without a Slack mapping.
           slack_mentions() {
-            jq -er --argjson users "$1" --arg phase "$NOTIFICATION_PHASE" '
+            jq -er --argjson users "$1" '
               if type != "object" then error("Expected GitHub-to-Slack map") else
                 with_entries(.key |= ascii_downcase) as $members |
                 [$users[] | ascii_downcase | . as $login |
-                  $members[$login] |
-                  if . == null then
-                    if ($phase | startswith("stage-")) then error("Missing Slack mapping for " + $login)
-                    else empty end
-                  elif type == "string" and test("^[UW][A-Z0-9]+$") then "<@" + . + ">"
+                  $members[$login] | select(. != null) |
+                  if type == "string" and test("^[UW][A-Z0-9]+$") then "<@" + . + ">"
                   else error("Invalid Slack member ID") end] | unique | join(" ") end'
           }
           deliver() {

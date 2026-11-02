@@ -174,9 +174,11 @@ immediately before delivery. Wrong phase/workflow pairs, stale attempts, and
 mismatched artifacts are rejected.
 
 Compose supplies the linked Feature/Bug's human assignees, excluding bots and
-`ecoscope-elebot`; a bot-authored PR does not change those recipients. New stage
-notifications fail explicitly when any recipient has no Slack mapping. Legacy
-callers keep their previous mapping behavior. Delivery reuses the saved issue
+`ecoscope-elebot`; a bot-authored PR does not change those recipients. Like production
+PR readiness, stage notifications omit Slack mentions for users without a mapping.
+Both messages still send, even when no recipients have a Slack mapping; GitHub
+mentions remain intact. The separate Ready to Ship notifier is unchanged.
+Delivery reuses the saved issue
 thread and existing receipt markers. In particular, the explicit preview phase
 retains its previous `stage-preview-failure:v1` marker to prevent duplicate alerts.
 

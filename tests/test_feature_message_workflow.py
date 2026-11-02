@@ -405,14 +405,27 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(writes, [])
 
-    def test_stage_missing_slack_mapping_is_explicit_and_does_not_send_partial_mentions(self):
-        phase = "stage-pr-checks-failed"
-        data = fixture(phase, "stage-pr-readiness.yml")
-        data["envelope"]["notifications"][0]["slack_users"] = ["enlivn", "unmapped-human"]
-        result, writes = self.run_workflow(data, phase)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Missing Slack mapping for unmapped-human", result.stderr)
-        self.assertEqual(writes, [])
+    def test_stage_missing_slack_mappings_omit_mentions_and_preserve_both_deliveries(self):
+        for phase, producer in (
+            ("stage-pr-checks-failed", "stage-pr-readiness.yml"),
+            ("stage-pr-checks-failed", "stopgap-stage-preview-deploy.yml"),
+            ("stage-pr-merged", "stage.yaml"),
+            ("stage-verification-failed", "stage.yaml"),
+        ):
+            for users in (["enlivn", "unmapped-human"], ["unmapped-human"]):
+                with self.subTest(phase=phase, producer=producer, users=users):
+                    data = fixture(phase, producer)
+                    message = data["envelope"]["notifications"][0]
+                    message["slack_users"] = users
+                    message["github_text"] = " ".join("@" + user for user in users) + " Prepared GitHub message"
+                    result, writes = self.run_workflow(data, phase)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual([call["method"] for call in writes], ["POST", "PATCH", "SLACK", "PATCH"])
+                    self.assertIn(message["github_text"], writes[0]["body"]["body"])
+                    slack = next(call for call in writes if call["method"] == "SLACK")
+                    prefix = "<@U0123> " if "enlivn" in users else ""
+                    self.assertEqual(slack["body"]["text"].strip(), prefix + "Prepared Slack message")
+                    self.assertNotIn("Missing Slack mapping", result.stderr)
 
     def test_legacy_missing_slack_mapping_keeps_existing_delivery_behavior(self):
         data = fixture()
