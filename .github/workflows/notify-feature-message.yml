@@ -52,9 +52,29 @@ jobs:
           # Use one pinned API version for source verification and issue-comment operations.
           api() { gh api -H 'X-GitHub-Api-Version: 2022-11-28' "$@"; }
           fail() { echo "::error::$*" >&2; return 1; }
+          verify_stage_target() {
+            [[ "$NOTIFICATION_PHASE" == stage-* ]] || return 0
+            [[ $(api "$endpoint/actions/runs/$SOURCE_RUN_ID" --jq .run_attempt) == "$SOURCE_RUN_ATTEMPT" ]] || return 1
+            api "$endpoint/pulls/$stage_pr" |
+              jq -e --arg repo "$repo" --arg head "$stage_head" \
+                --arg phase "$NOTIFICATION_PHASE" --arg merge "${stage_merge:-}" --argjson run "$source_run" '
+                .base.ref == "stage" and .base.repo.full_name == $repo and
+                .head.repo.full_name == $repo and .head.sha == $head and
+                .head.sha == $run.head_sha and .head.ref == $run.head_branch and
+                (if $phase == "stage-pr-checks-failed" then .state == "open" and .merged == false
+                 else .state == "closed" and .merged == true and .merge_commit_sha == $merge and
+                   (($run.created_at | fromdateiso8601) >= (.merged_at | fromdateiso8601)) end)' >/dev/null || return 1
+            if [[ "$NOTIFICATION_PHASE" != stage-pr-checks-failed ]]; then
+              api "$endpoint/compare/$stage_merge...stage" --jq .status |
+                { read -r status; [[ "$status" == ahead || "$status" == identical ]]; } || return 1
+            fi
+          }
           # A readiness notice follows one exact PR head, including while its producer is still running.
           verify_readiness_target() {
-            [[ "${source_path:-}" == .github/workflows/production-pr-readiness.yml ]] || return 0
+            if [[ "${source_path:-}" != .github/workflows/production-pr-readiness.yml ]]; then
+              verify_stage_target
+              return
+            fi
             api "$endpoint/pulls/$readiness_pr" |
               jq -e --arg repo "$repo" --arg head "$readiness_head" \
                 --arg phase "$NOTIFICATION_PHASE" --argjson run "$source_run" '
@@ -81,14 +101,17 @@ jobs:
               then {channel_id,thread_ts} else error("Invalid saved Slack thread") end'
           }
           # Compose supplies GitHub logins; only this repository holds the Slack member-ID mapping.
-          # Match logins case-insensitively and silently skip users without a Slack mapping.
+          # New stage notices must not silently omit a human ticket assignee.
           slack_mentions() {
-            jq -er --argjson users "$1" '
+            jq -er --argjson users "$1" --arg phase "$NOTIFICATION_PHASE" '
               if type != "object" then error("Expected GitHub-to-Slack map") else
                 with_entries(.key |= ascii_downcase) as $members |
                 [$users[] | ascii_downcase | . as $login |
-                  $members[$login] | select(. != null) |
-                  if type == "string" and test("^[UW][A-Z0-9]+$") then "<@" + . + ">"
+                  $members[$login] |
+                  if . == null then
+                    if ($phase | startswith("stage-")) then error("Missing Slack mapping for " + $login)
+                    else empty end
+                  elif type == "string" and test("^[UW][A-Z0-9]+$") then "<@" + . + ">"
                   else error("Invalid Slack member ID") end] | unique | join(" ") end'
           }
           deliver() {
@@ -158,6 +181,7 @@ jobs:
               payload=$(printf '%s' "$metadata" | jq --arg text "$mentions $slack_text" '
                 {channel:.channel_id,thread_ts:.thread_ts,text:$text,unfurl_links:false,unfurl_media:false,
                  blocks:[{type:"section",text:{type:"mrkdwn",text:$text,verbatim:true}}]}')
+              verify_stage_target || return 1
               if ! status=$(curl --silent --show-error --max-time 30 --output "$work/slack" --write-out '%{http_code}' \
                 -H "Authorization: Bearer $SLACK_BOT_TOKEN" -H 'Content-Type: application/json' \
                 --data-binary "$payload" https://slack.com/api/chat.postMessage); then
@@ -189,6 +213,7 @@ jobs:
               state=$(printf '%s' "$notification" | jq -c --argjson reply "$reply" '.metadata + $reply')
               # Re-read before patching so unrelated edits to the visible comment are retained.
               current=$(api "$path") || { failures=1; continue; }
+              verify_stage_target || return 1
               printf '%s' "$current" | jq --arg state "$state" '
                 {body:((.body | split("\n<!-- promotion-slack-pending -->") | join("")) + "\n<!-- promotion-slack-sent:" + $state + " -->")}' |
                 api --method PATCH "$path" --input - --silent || { failures=1; continue; }
@@ -210,15 +235,30 @@ jobs:
           # Existing producers finish first. Readiness can deliver a completed upload checkpoint early.
           for ((wait_count=0; wait_count<30; wait_count++)); do
             source_run=$(api "$endpoint/actions/runs/$SOURCE_RUN_ID/attempts/$SOURCE_RUN_ATTEMPT")
-            if [[ $(printf '%s' "$source_run" | jq -r .path) == .github/workflows/production-pr-readiness.yml &&
-                  $(printf '%s' "$source_run" | jq -r .status) == in_progress ]]; then break; fi
+            if printf '%s' "$source_run" | jq -e --arg phase "$NOTIFICATION_PHASE" '
+              .status == "in_progress" and (
+                .path == ".github/workflows/production-pr-readiness.yml" or
+                ($phase == "stage-pr-checks-failed" and
+                  (.path == ".github/workflows/stage-pr-readiness.yml" or
+                   .path == ".github/workflows/stopgap-stage-preview-deploy.yml")) or
+                (($phase == "stage-pr-merged" or $phase == "stage-verification-failed") and
+                  .path == ".github/workflows/stage.yaml"))' >/dev/null; then break; fi
             [[ $(printf '%s' "$source_run" | jq -r .status) == completed ]] && break
             sleep 10
           done
-          printf '%s' "$source_run" | jq -e --arg repo "$repo" --argjson attempt "$SOURCE_RUN_ATTEMPT" '
+          printf '%s' "$source_run" | jq -e --arg repo "$repo" --argjson attempt "$SOURCE_RUN_ATTEMPT" \
+            --arg phase "$NOTIFICATION_PHASE" '
             .repository.full_name == $repo and .run_attempt == $attempt and (
               (.path == ".github/workflows/production-pr-readiness.yml" and
                 (.event == "pull_request" or .event == "workflow_dispatch") and
+                (.status == "in_progress" or (.status == "completed" and
+                  (.conclusion == "success" or .conclusion == "failure" or .conclusion == "cancelled")))) or
+              (.event == "pull_request" and
+                (($phase == "stage-pr-checks-failed" and
+                  (.path == ".github/workflows/stage-pr-readiness.yml" or
+                   .path == ".github/workflows/stopgap-stage-preview-deploy.yml")) or
+                 (($phase == "stage-pr-merged" or $phase == "stage-verification-failed") and
+                   .path == ".github/workflows/stage.yaml")) and
                 (.status == "in_progress" or (.status == "completed" and
                   (.conclusion == "success" or .conclusion == "failure" or .conclusion == "cancelled")))) or
               (.status == "completed" and
@@ -236,6 +276,16 @@ jobs:
           upload_step='Save feature notifications'
           if [[ "$source_path" == .github/workflows/production-pr-readiness.yml ]]; then
             [[ "$NOTIFICATION_PHASE" =~ ^(update-start|ready|changed-contents|merge-conflicts|checks-failed|error)$ ]]
+            artifact_name+="-$NOTIFICATION_PHASE"
+            upload_step+=" ($NOTIFICATION_PHASE)"
+          elif [[ "$NOTIFICATION_PHASE" == stage-* ]]; then
+            case "$source_path:$NOTIFICATION_PHASE" in
+              .github/workflows/stage-pr-readiness.yml:stage-pr-checks-failed|\
+              .github/workflows/stopgap-stage-preview-deploy.yml:stage-pr-checks-failed|\
+              .github/workflows/stage.yaml:stage-pr-merged|\
+              .github/workflows/stage.yaml:stage-verification-failed) ;;
+              *) fail 'Stage notification phase does not match its source workflow.'; exit 1 ;;
+            esac
             artifact_name+="-$NOTIFICATION_PHASE"
             upload_step+=" ($NOTIFICATION_PHASE)"
           else
@@ -283,6 +333,16 @@ jobs:
             readiness_head=$(jq -er '.production_head_sha | select(type == "string" and test("^[a-f0-9]{40}$"))' "$work/messages.json")
             jq -e --arg phase "$NOTIFICATION_PHASE" '.outcome == $phase' "$work/messages.json" >/dev/null
             verify_readiness_target
+          elif [[ "$NOTIFICATION_PHASE" == stage-* ]]; then
+            stage_pr=$(jq -er '.source_pr | select(type == "string" and test("^[1-9][0-9]*$"))' "$work/messages.json")
+            stage_head=$(jq -er '.stage_head_sha | select(type == "string" and test("^[a-f0-9]{40}$"))' "$work/messages.json")
+            jq -e --arg phase "$NOTIFICATION_PHASE" '.outcome == $phase' "$work/messages.json" >/dev/null
+            if [[ "$NOTIFICATION_PHASE" != stage-pr-checks-failed ]]; then
+              stage_merge=$(jq -er '.stage_sha | select(type == "string" and test("^[a-f0-9]{40}$"))' "$work/messages.json")
+              jq -e --arg run "$SOURCE_RUN_ID" --arg attempt "$SOURCE_RUN_ATTEMPT" '
+                .stage_run_id == $run and .stage_run_attempt == $attempt' "$work/messages.json" >/dev/null
+            fi
+            verify_stage_target
           elif [[ "$source_path" != .github/workflows/promote-stage-to-prod.yml &&
                 "$source_path" != .github/workflows/stopgap-stage-preview-deploy.yml ]]; then
             if [[ "$source_path" == .github/workflows/prod.yaml ]]; then

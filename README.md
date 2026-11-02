@@ -139,6 +139,47 @@ python -B -m unittest discover -s tests -v
 These checks execute the workflow's delivery script using local GitHub and
 Slack fixtures; they do not post real notifications.
 
+### Stage-readiness notifications
+
+Merge this receiver support into `.github/main` before enabling the new Compose
+producers. Existing production phases and unphased stage, preview, and production
+callers keep their current inputs, artifacts, and delivery markers.
+
+The three additional `notification_phase` values are:
+
+1. `stage-pr-checks-failed`: sent by `stage-pr-readiness.yml` or
+   `stopgap-stage-preview-deploy.yml` for an open, unmerged PR into `stage`.
+2. `stage-pr-merged`: sent by `stage.yaml` after a confirmed merge into `stage`.
+3. `stage-verification-failed`: sent by `stage.yaml` when subsequent deployment
+   or workflow template verification fails.
+
+Each phase uses `feature-notifications-<attempt>-<phase>` and a successful
+`Save feature notifications (<phase>)` upload step. A validated upload checkpoint
+can be delivered while its source workflow is still running. All three envelopes
+include the existing repository/run/notification fields plus:
+
+```json
+{
+  "source_pr": "123",
+  "stage_head_sha": "<the producer run's exact PR head SHA>",
+  "outcome": "stage-pr-checks-failed"
+}
+```
+
+The post-merge phases also include `stage_sha`, `stage_run_id`, and
+`stage_run_attempt`. The PR must be merged into `stage` at that exact merge SHA,
+the run must have started after the merge, and the merge must remain in stage's
+history. The source PR head/branch and current run attempt are checked again
+immediately before delivery. Wrong phase/workflow pairs, stale attempts, and
+mismatched artifacts are rejected.
+
+Compose supplies the linked Feature/Bug's human assignees, excluding bots and
+`ecoscope-elebot`; a bot-authored PR does not change those recipients. New stage
+notifications fail explicitly when any recipient has no Slack mapping. Legacy
+callers keep their previous mapping behavior. Delivery reuses the saved issue
+thread and existing receipt markers. In particular, the explicit preview phase
+retains its previous `stage-preview-failure:v1` marker to prevent duplicate alerts.
+
 ### Automerge setup
 
 In each calling repository:
