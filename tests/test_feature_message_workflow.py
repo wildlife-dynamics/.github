@@ -37,7 +37,7 @@ elif endpoint == "user":
 elif endpoint.endswith("/attempts/1/jobs?per_page=100"):
     value = [{"jobs": [{"steps": [{"name": data["upload_step"], "conclusion": data.get("upload_conclusion", "success")}]}]}]
 elif endpoint.endswith("/artifacts?per_page=100"):
-    value = [{"artifacts": [data["artifact"]]}]
+    value = [{"artifacts": data.get("artifacts", [data["artifact"]])}]
 elif endpoint.endswith("/artifacts/200/zip"):
     sys.stdout.buffer.write((root / "artifact.zip").read_bytes())
     sys.exit(0)
@@ -50,23 +50,14 @@ elif endpoint.endswith("/runs/100"):
     value = {"run_attempt": data.get("latest_attempt", 1)}
     if reads >= data.get("change_attempt_after", 1000):
         value["run_attempt"] = 2
-elif endpoint.endswith("/pulls/3"):
-    counter = root / "target_reads"
-    reads = int(counter.read_text()) + 1 if counter.exists() else 1
-    counter.write_text(str(reads))
-    value = data["pr"]
-    if reads >= data.get("change_head_after", 1000):
-        value["head"]["sha"] = "c" * 40
-    if reads >= data.get("change_merge_after", 1000):
-        value["merge_commit_sha"] = "c" * 40
+elif "/pulls/" in endpoint or "/compare/" in endpoint:
+    sys.exit("Delivery must not recompute release policy: " + endpoint)
 elif endpoint.endswith("/issues/9/comments?per_page=100"):
     value = [data["comments"]]
 elif endpoint.endswith("/issues/9"):
-    value = {"number": 9}
+    value = data.get("issue", {"number": 9})
 elif endpoint.endswith("/issues/comments/10"):
     value = json.loads((root / "comment.json").read_text())
-elif "/compare/" in endpoint:
-    value = {"status": data.get("compare_status", "ahead")}
 else:
     sys.exit("Unexpected gh request: " + endpoint)
 
@@ -114,6 +105,7 @@ def fixture(phase="ready", producer="production-pr-readiness.yml"):
     return {
         "run": {
             "repository": {"full_name": "wildlife-dynamics/compose"},
+            "head_repository": {"full_name": "wildlife-dynamics/compose"},
             "path": ".github/workflows/" + producer, "run_attempt": 1,
             "event": "pull_request", "head_sha": HEAD, "head_branch": "release/test",
             "status": "completed" if legacy else "in_progress",
@@ -180,13 +172,18 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
             writes = [call for call in calls if call["method"] != "GET"]
             return result, writes
 
+    def assert_delivered(self, data, phase="ready"):
+        result, writes = self.run_workflow(data, phase)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([call["method"] for call in writes], ["POST", "PATCH", "SLACK", "PATCH"])
+
     def assert_rejected(self, data, phase="ready"):
         result, writes = self.run_workflow(data, phase)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(writes, [], result.stdout + result.stderr)
 
     def test_open_readiness_checkpoint_delivers_while_producer_runs(self):
-        for event in ("pull_request", "workflow_dispatch"):
+        for event in ("pull_request", "pull_request_target", "workflow_dispatch"):
             with self.subTest(event=event):
                 data = fixture()
                 data["run"]["event"] = event
@@ -199,31 +196,31 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(writes)
 
-    def test_closed_pr_rejects_every_other_readiness_notice(self):
+    def test_closed_pr_does_not_block_prepared_readiness_notices(self):
         for phase in ("update-start", "ready", "merge-conflicts", "checks-failed", "error"):
             with self.subTest(phase=phase):
                 data = fixture(phase)
                 data["pr"]["state"] = "closed"
-                self.assert_rejected(data, phase)
+                self.assert_delivered(data, phase)
 
-    def test_changed_contents_notice_requires_closed_unmerged_pr(self):
+    def test_changed_contents_message_does_not_revalidate_pr_state(self):
         for changes in ({"state": "open"}, {"merged": True}):
             with self.subTest(changes=changes):
                 data = fixture("changed-contents")
                 data["pr"].update(changes)
-                self.assert_rejected(data, "changed-contents")
+                self.assert_delivered(data, "changed-contents")
 
-    def test_stale_head_is_rejected(self):
+    def test_prepared_message_survives_pr_head_change(self):
         data = fixture()
         data["pr"]["head"]["sha"] = "c" * 40
-        self.assert_rejected(data)
+        self.assert_delivered(data)
 
-    def test_head_is_rechecked_immediately_before_posting(self):
+    def test_transport_does_not_query_changing_release_state(self):
         data = fixture()
-        data["change_head_after"] = 4
-        self.assert_rejected(data)
+        data["change_head_after"] = 1
+        self.assert_delivered(data)
 
-    def test_fork_or_wrong_target_branch_is_rejected(self):
+    def test_target_branch_and_pr_metadata_are_owned_by_the_caller(self):
         for section, key, value in (
             ("head", "repo", {"full_name": "untrusted/compose"}),
             ("base", "repo", {"full_name": "untrusted/compose"}),
@@ -233,11 +230,13 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
             with self.subTest(section=section, key=key):
                 data = fixture()
                 data["pr"][section][key] = value
-                self.assert_rejected(data)
+                self.assert_delivered(data)
 
     def test_untrusted_source_or_event_is_rejected(self):
         for changes in (
             {"repository": {"full_name": "untrusted/compose"}},
+            {"head_repository": {"full_name": "untrusted/compose"}},
+            {"head_repository": None},
             {"path": ".github/workflows/untrusted.yml"},
             {"event": "push"},
         ):
@@ -264,6 +263,69 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
             with self.subTest(variant=index):
                 self.assert_rejected(data)
 
+    def test_all_existing_producers_support_transport_events(self):
+        for producer in ("production-pr-readiness.yml", "stage-pr-readiness.yml",
+                         "stage-preview-deploy.yml", "stopgap-stage-preview-deploy.yml",
+                         "stage.yaml", "prod.yaml", "promote-stage-to-prod.yml"):
+            for event in ("pull_request", "pull_request_target", "workflow_dispatch"):
+                with self.subTest(producer=producer, event=event):
+                    data = fixture("", producer)
+                    data["artifact"]["name"] = "feature-notifications-1"
+                    data["upload_step"] = "Save feature notifications"
+                    data["run"].update(event=event, head_branch="main")
+                    self.assert_delivered(data, "")
+
+    def test_malformed_delivery_envelopes_are_rejected(self):
+        for field, value in (("version", 2), ("repository", "untrusted/compose"),
+                             ("source_run_id", "999"), ("source_run_attempt", "2"),
+                             ("notifications", [])):
+            with self.subTest(field=field):
+                data = fixture()
+                data["envelope"][field] = value
+                self.assert_rejected(data)
+        for field, value in (("issue_number", "../9"), ("github_text", "<!-- injected -->"),
+                             ("slack_users", ["invalid user"]), ("slack_text", "x" * 2501),
+                             ("marker", "not-a-marker"), ("metadata", {"bad": "-->"})):
+            with self.subTest(field=field):
+                data = fixture()
+                data["envelope"]["notifications"][0][field] = value
+                self.assert_rejected(data)
+
+    def test_artifact_provenance_and_size_remain_required(self):
+        for field, value in (("expired", True), ("size_in_bytes", 0),
+                             ("size_in_bytes", 1048577), ("name", "feature-notifications-2-ready")):
+            with self.subTest(field=field):
+                data = fixture()
+                data["artifact"][field] = value
+                self.assert_rejected(data)
+        data = fixture()
+        data["artifact"]["workflow_run"]["id"] = 999
+        self.assert_rejected(data)
+        data = fixture()
+        data["artifacts"] = [data["artifact"], data["artifact"]]
+        self.assert_rejected(data)
+
+    def test_unsafe_phase_names_are_rejected(self):
+        for phase in ("../ready", "Ready", "a" * 65, "ready\nerror"):
+            with self.subTest(phase=phase):
+                self.assert_rejected(fixture(phase), phase)
+
+    def test_pending_delivery_is_not_retried_automatically(self):
+        data = fixture()
+        data["comments"].append({
+            "id": 10, "user": {"login": "ecoscope-elebot"},
+            "body": MARKER + "\n<!-- promotion-slack-pending -->",
+        })
+        self.assert_rejected(data)
+
+    def test_issue_destination_and_saved_thread_remain_required(self):
+        data = fixture()
+        data["issue"] = {"number": 9, "pull_request": {"url": "https://example.test/pr"}}
+        self.assert_rejected(data)
+        data = fixture()
+        data["comments"] = []
+        self.assert_rejected(data)
+
     def test_confirmed_notification_is_not_sent_twice(self):
         data = fixture()
         data["comments"].append({
@@ -281,15 +343,18 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(writes)
 
-    def test_existing_producers_cannot_use_readiness_checkpoint_input(self):
-        self.assert_rejected(fixture(producer="stage.yaml"))
+    def test_trusted_producers_can_supply_a_phase_without_business_pairing(self):
+        data = fixture(producer="stage.yaml")
+        data["artifact"]["name"] = "feature-notifications-1-ready"
+        data["upload_step"] = "Save feature notifications (ready)"
+        self.assert_delivered(data)
 
-    def test_legacy_postmerge_verification_is_not_relaxed(self):
+    def test_legacy_delivery_does_not_repeat_postmerge_verification(self):
         for producer in ("stage.yaml", "prod.yaml"):
             with self.subTest(producer=producer):
                 data = fixture(producer=producer)
                 data["pr"]["merged"] = False
-                self.assert_rejected(data, "")
+                self.assert_delivered(data, "")
 
     def test_stage_phases_deliver_at_their_own_upload_checkpoints(self):
         for phase, producer in (
@@ -304,7 +369,7 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual([call["method"] for call in writes], ["POST", "PATCH", "SLACK", "PATCH"])
 
-    def test_stage_phases_reject_other_workflow_and_event_pairs(self):
+    def test_phase_delivery_is_independent_of_trusted_producer_event(self):
         for phase, producer in (
             ("stage-pr-merged", "stage-pr-readiness.yml"),
             ("stage-verification-failed", "stopgap-stage-preview-deploy.yml"),
@@ -315,43 +380,26 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
         ):
             with self.subTest(phase=phase, producer=producer):
                 data = fixture(phase, producer)
-                data["run"].update(status="completed", conclusion="failure")
-                self.assert_rejected(data, phase)
-        data = fixture("stage-pr-checks-failed", "stage-pr-readiness.yml")
-        data["run"]["event"] = "workflow_dispatch"
-        self.assert_rejected(data, "stage-pr-checks-failed")
+                data["run"].update(event="workflow_dispatch", head_branch="main", status="completed", conclusion="failure")
+                self.assert_delivered(data, phase)
 
-    def test_stage_premerge_notice_requires_open_current_same_repository_pr(self):
-        for section, key, value in (
-            (None, "state", "closed"),
-            (None, "merged", True),
-            ("base", "ref", "main"),
-            ("head", "repo", {"full_name": "untrusted/compose"}),
-            ("head", "sha", "c" * 40),
-            ("head", "ref", "other-branch"),
-        ):
-            with self.subTest(section=section, key=key):
+    def test_stage_failure_delivery_does_not_recompute_pr_eligibility(self):
+        for changes in ({"state": "closed"}, {"merged": True},
+                        {"head": {"sha": "c" * 40}}, {"base": {"ref": "main"}}):
+            with self.subTest(changes=changes):
                 data = fixture("stage-pr-checks-failed", "stage-pr-readiness.yml")
-                target = data["pr"] if section is None else data["pr"][section]
-                target[key] = value
-                self.assert_rejected(data, "stage-pr-checks-failed")
+                data["pr"].update(changes)
+                self.assert_delivered(data, "stage-pr-checks-failed")
 
-    def test_stage_postmerge_notices_require_exact_confirmed_stage_merge(self):
+    def test_stage_postmerge_messages_follow_prepared_artifact(self):
         for phase in ("stage-pr-merged", "stage-verification-failed"):
-            for changes in (
-                {"state": "open"},
-                {"merged": False},
-                {"merge_commit_sha": "c" * 40},
-                {"merged_at": "2026-10-31T12:00:02Z"},
-                {"base": {"ref": "prod", "repo": {"full_name": "wildlife-dynamics/compose"}}},
-            ):
+            for changes in ({"state": "open"}, {"merged": False},
+                            {"merge_commit_sha": "c" * 40}, {"merged_at": "2026-10-31T12:00:02Z"}):
                 with self.subTest(phase=phase, changes=changes):
                     data = fixture(phase, "stage.yaml")
                     data["pr"].update(changes)
-                    self.assert_rejected(data, phase)
-            data = fixture(phase, "stage.yaml")
-            data["compare_status"] = "diverged"
-            self.assert_rejected(data, phase)
+                    data["compare_status"] = "diverged"
+                    self.assert_delivered(data, phase)
 
     def test_stage_artifact_checkpoint_and_envelope_are_bound_to_phase_and_attempt(self):
         phase = "stage-pr-checks-failed"
@@ -360,7 +408,6 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
             ("upload_conclusion", None, "failure"),
             ("artifact", "name", "feature-notifications-1"),
             ("envelope", "outcome", "stage-pr-merged"),
-            ("envelope", "stage_head_sha", "c" * 40),
             ("envelope", "source_run_attempt", "2"),
             ("latest_attempt", None, 2),
         )
@@ -376,21 +423,16 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
             with self.subTest(key=key):
                 data = fixture("stage-pr-merged", "stage.yaml")
                 data["envelope"][key] = value
-                self.assert_rejected(data, "stage-pr-merged")
+                self.assert_delivered(data, "stage-pr-merged")
 
-    def test_stage_target_and_latest_attempt_are_rechecked_before_posting(self):
-        for phase, producer in (
-            ("stage-pr-checks-failed", "stage-pr-readiness.yml"),
-            ("stage-pr-merged", "stage.yaml"),
-        ):
-            for changes in ({"change_head_after": 4}, {"change_attempt_after": 6}):
-                with self.subTest(phase=phase, changes=changes):
-                    data = fixture(phase, producer)
-                    data.update(changes)
-                    self.assert_rejected(data, phase)
-        data = fixture("stage-pr-merged", "stage.yaml")
-        data["change_merge_after"] = 4
-        self.assert_rejected(data, "stage-pr-merged")
+    def test_latest_attempt_is_rechecked_before_posting_for_every_phase(self):
+        for phase, producer in (("ready", "production-pr-readiness.yml"),
+                               ("stage-pr-checks-failed", "stage-pr-readiness.yml"),
+                               ("stage-pr-merged", "stage.yaml")):
+            with self.subTest(phase=phase):
+                data = fixture(phase, producer)
+                data["change_attempt_after"] = 4
+                self.assert_rejected(data, phase)
 
     def test_explicit_preview_phase_preserves_legacy_delivery_marker(self):
         phase = "stage-pr-checks-failed"

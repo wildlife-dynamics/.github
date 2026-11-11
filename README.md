@@ -103,7 +103,7 @@ Source workflow and artifact verification remain required.
 `notify-feature-message.yml` also accepts messages prepared by Compose's
 `production-pr-readiness.yml`. Deploy this support on `.github/main` before
 enabling that producer. Existing stage, preview, and production callers retain
-their current inputs, artifact names, and post-merge verification.
+their current inputs, artifact names, and delivery markers.
 
 The readiness caller supplies the existing run ID and attempt inputs plus
 `notification_phase`: `update-start`, `ready`, `changed-contents`,
@@ -123,10 +123,10 @@ repository/run/notification fields plus:
 
 The service accepts a completed upload checkpoint while the readiness producer
 is still running, allowing an update-start notice before readiness finishes.
-It verifies that the affected PR targets `prod` in Compose, belongs to the same
-repository, and still has the producer's exact head and branch. The
-`changed-contents` phase requires a closed, unmerged PR; every other phase
-requires an open, unmerged PR. Target freshness is rechecked before delivery.
+Compose owns PR state, candidate revision, merge and readiness decisions. The
+receiver validates the trusted source run, its current attempt, successful upload
+checkpoint, artifact provenance and bounded delivery payload. It does not query
+PR state or repeat release checks when delivering the prepared message.
 Feature-specific recipients and existing delivery markers continue to control
 mentions and duplicate prevention.
 
@@ -167,11 +167,27 @@ include the existing repository/run/notification fields plus:
 ```
 
 The post-merge phases also include `stage_sha`, `stage_run_id`, and
-`stage_run_attempt`. The PR must be merged into `stage` at that exact merge SHA,
-the run must have started after the merge, and the merge must remain in stage's
-history. The source PR head/branch and current run attempt are checked again
-immediately before delivery. Wrong phase/workflow pairs, stale attempts, and
-mismatched artifacts are rejected.
+`stage_run_attempt`. These release fields remain caller-owned metadata. The
+receiver preserves the supplied text and markers without checking PR state,
+head/base revisions, merge timing or branch ancestry.
+
+The explicit source workflow allowlist includes `stage-pr-readiness.yml`,
+`production-pr-readiness.yml`, `stage-preview-deploy.yml`, the legacy
+`stopgap-stage-preview-deploy.yml`, `stage.yaml`, `prod.yaml`, and
+`promote-stage-to-prod.yml`, all in `wildlife-dynamics/compose`. The source run
+and its head repository must both belong to Compose. Authorized callers may
+use `pull_request`, `pull_request_target`, or `workflow_dispatch`; event, branch
+and release phase combinations belong to the producer's policy.
+
+An optional phase is a bounded lowercase name containing letters, digits and
+hyphens. It selects the existing artifact and upload checkpoint suffix, and must
+match the envelope's `outcome`. An empty phase retains the original unsuffixed
+artifact and checkpoint names. Every delivery still requires the current run
+attempt, a successful upload step, one nonexpired size-limited artifact bound
+to that run and source SHA, and the matching repository/run/attempt envelope.
+The source attempt is checked again before delivery side effects. Existing
+thread lookup, recipient validation, deduplication and pending-receipt retry
+behavior remain unchanged.
 
 Compose supplies the linked Feature/Bug's human assignees, excluding bots and
 `ecoscope-elebot`; a bot-authored PR does not change those recipients. Like production
