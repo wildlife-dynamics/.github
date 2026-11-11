@@ -6,6 +6,13 @@
 #   `pr_body` (required, string): Pull request body to inspect.
 #   `min_issue_description_length` (optional, number): Minimum linked issue
 #     description length. Defaults to `30`.
+#   `title_ticket_match` (optional, string): Empty by default to retain the
+#     existing check. `all` requires every ticket in the title to appear in a
+#     recognized description clause; `at_least_one` requires at least one.
+#     Both modes require `<tickets>: <plain-language description>`, without a
+#     Conventional Commit prefix, including after the ticket numbers.
+#     Matching uses the existing clauses, not arbitrary references. Markdown
+#     links and references to other repositories remain unrecognized.
 #
 # Example caller:
 #
@@ -24,6 +31,8 @@
 #     with:
 #       pr_body: ${{ github.event.pull_request.body }}
 #       min_issue_description_length: 30
+#       # Optional opt-in: all or at_least_one
+#       title_ticket_match: all
 
 name: Check PRs mention a linked issue with a sufficient description
 
@@ -38,6 +47,11 @@ on:
         required: false
         type: number
         default: 30
+      title_ticket_match:
+        description: Match all or at_least_one title tickets to recognized description clauses; empty disables title validation
+        required: false
+        type: string
+        default: ""
 
 jobs:
   check-pull-request-for-linked-issue:
@@ -51,12 +65,46 @@ jobs:
         env:
           pr_body: ${{ inputs.pr_body }}
           min_issue_description_length: ${{ inputs.min_issue_description_length }}
+          TITLE_TICKET_MATCH: ${{ inputs.title_ticket_match }}
         with:
           script: |
             const prBody = process.env.pr_body || '';
             const { owner, repo } = context.repo;
 
             const issuePattern = `(?:closes|closes|closed|fix|fixes|fixed|resolve|resolves|resolved|relates to|related to|towards\)\\s+(?:(?:(?:${owner}\/${repo})?#)|(?:(?:https:\/\/github\.com\/)?${owner}\/${repo}\/issues\/))?(\\d+)`
+            const titleTicketMatch = process.env.TITLE_TICKET_MATCH || '';
+
+            if (titleTicketMatch) {
+              if (!['all', 'at_least_one'].includes(titleTicketMatch)) {
+                core.setFailed('title_ticket_match must be empty, "all" or "at_least_one".');
+                return;
+              }
+
+              const titleMatch = /^(\d+(?:,\s*\d+)*): (\S.*)$/.exec(context.payload.pull_request.title);
+              const conventionalCommitPrefix = /^(?:feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(?:\([^)]*\))?!?:/i;
+
+              if (!titleMatch || conventionalCommitPrefix.test(titleMatch[2])) {
+                core.setFailed('Expected: one or more comma-separated ticket numbers, followed by ": " and a plain-language description without a Conventional Commit prefix.');
+                return;
+              }
+
+              const titleIssues = titleMatch[1].split(/,\s*/);
+              const linkedIssues = new Set(
+                [...prBody.matchAll(new RegExp(issuePattern, 'gi'))].map(match => match[1])
+              );
+              const isLinked = number => linkedIssues.has(number);
+              const valid = titleTicketMatch === 'all'
+                ? titleIssues.every(isLinked)
+                : titleIssues.some(isLinked);
+
+              if (!valid) {
+                core.setFailed(titleTicketMatch === 'all'
+                  ? 'Every title ticket must also be linked in the description.'
+                  : 'At least one title ticket must also be linked in the description.');
+                return;
+              }
+            }
+
             const issuePatternRegexp = new RegExp(issuePattern, 'i');
             const matches = issuePatternRegexp.exec(prBody);
 

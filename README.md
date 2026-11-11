@@ -25,6 +25,29 @@ that can be called from other repositories.
 
 Usage and caller examples are documented at the top of each workflow.
 
+### Optional PR title validation
+
+Callers of `_check-pull-requests-mention-linked-issue.yml` can set
+`title_ticket_match` to `all` or `at_least_one`. Its default, an empty string,
+keeps the existing linked-issue check without validating the title.
+
+Both modes require one or more comma-separated issue numbers followed by
+`: ` and a plain-language description, such as `101: Update sample behavior` or
+`101, 202: Update sample behavior`. Conventional Commit
+prefixes such as `feat(sample):` or `fix:` are rejected, including after the
+ticket numbers. Capitalization and terminal punctuation are not restricted.
+
+`all` requires every ticket **in the title** to match a recognized issue clause
+in the description; `at_least_one` requires at least one title ticket to match.
+The existing description parser is unchanged: it does not recognize arbitrary
+references, Markdown links or cross-repository issue links. For example,
+`101: Update sample behavior` matches `Related to #101` even if the description
+also contains a Markdown link to an issue in another repository. Existing
+issue-existence and minimum-description checks still run. Unknown nonempty
+modes fail the check.
+
+The shared workflow must merge before callers opt in on `main`.
+
 ### Feature and Bug completion notifications
 
 Each repository's caller runs when an issue closes. The reusable
