@@ -58,7 +58,12 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Run notification regression tests
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Run workflow regression tests
         run: python -B -m unittest discover -s tests -v
 
   notify-feature:
