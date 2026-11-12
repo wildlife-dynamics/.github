@@ -201,7 +201,7 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
     def github_only_fixture(self, phase="stage-pr-merged", producer="stage.yaml"):
         data = fixture(phase, producer)
         message = data["envelope"]["notifications"][0]
-        message["slack"] = False
+        message["send_to_slack"] = False
         del message["slack_text"]
         del message["slack_users"]
         data.update(comments=[], slack_members="invalid JSON", slack_token="")
@@ -278,10 +278,10 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
 
     def test_mixed_batch_routes_only_requested_messages_to_slack(self):
         for explicit in (False, True):
-            with self.subTest(explicit_slack=explicit):
+            with self.subTest(explicit_send_to_slack=explicit):
                 data = fixture()
                 if explicit:
-                    data["envelope"]["notifications"][0]["slack"] = True
+                    data["envelope"]["notifications"][0]["send_to_slack"] = True
                 only = self.github_only_fixture()["envelope"]["notifications"][0]
                 only["issue_number"] = "10"
                 data["envelope"]["notifications"].append(only)
@@ -301,12 +301,12 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
         self.assertIn("None of the linked tickets has a saved Slack thread", result.stderr)
         self.assertEqual([call["method"] for call in writes], ["POST"])
 
-    def test_nonboolean_slack_flags_reject_entire_batch_before_writes(self):
+    def test_nonboolean_send_to_slack_flags_reject_entire_batch_before_writes(self):
         for flag in (None, 0, 1, "false", "true", [], {}):
             with self.subTest(flag=flag):
                 data = self.github_only_fixture()
                 invalid = copy.deepcopy(data["envelope"]["notifications"][0])
-                invalid.update(issue_number="10", slack=flag)
+                invalid.update(issue_number="10", send_to_slack=flag)
                 data["envelope"]["notifications"].append(invalid)
                 self.assert_rejected(data, "stage-pr-merged")
 
@@ -332,7 +332,7 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
                 with self.subTest(explicit=explicit, field=field):
                     data = fixture()
                     if explicit:
-                        data["envelope"]["notifications"][0]["slack"] = True
+                        data["envelope"]["notifications"][0]["send_to_slack"] = True
                     del data["envelope"]["notifications"][0][field]
                     self.assert_rejected(data)
 

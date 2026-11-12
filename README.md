@@ -223,24 +223,25 @@ retains its previous `stage-preview-failure:v1` marker to prevent duplicate aler
 
 ### Per-message delivery channels
 
-Each `notify-feature-message.yml` notification can include a `slack` boolean.
+Each `notify-feature-message.yml` notification can include a `send_to_slack` boolean.
 Omitting it or setting it to `true` preserves GitHub and Slack delivery, including
 saved-thread lookup, recipient mapping, and pending/sent receipt handling.
 
-Set `"slack": false` for a GitHub-only issue comment. This path posts the supplied
-`github_text` with its stable `marker`, or reuses the existing matching bot comment
-without editing it. It does not read Slack thread metadata or delivery receipts,
-validate Slack mapping or credentials, or contact Slack. `slack_text` and
-`slack_users` can be omitted or empty; when supplied, they retain type, upper-size,
-and recipient-format validation. `metadata` and all source/artifact validation
-remain required. Nonboolean `slack` values reject the entire batch before writes.
+Set `"send_to_slack": false` for a GitHub-only issue comment. This path posts
+the supplied `github_text` with its stable `marker`, or reuses the existing
+matching bot comment without editing it. It does not read Slack thread metadata
+or delivery receipts, validate Slack mapping or credentials, or contact Slack.
+`slack_text` and `slack_users` can be omitted or empty; when supplied, they
+retain type, upper-size, and recipient-format validation. `metadata` and all
+source/artifact validation remain required. Nonboolean `send_to_slack` values
+reject the entire batch before writes.
 
 ```json
 {
   "issue_number": "9",
   "marker": "<!-- stage-ticket:v1 pr=3 -->",
   "github_text": "Prepared GitHub message",
-  "slack": false,
+  "send_to_slack": false,
   "metadata": {}
 }
 ```
