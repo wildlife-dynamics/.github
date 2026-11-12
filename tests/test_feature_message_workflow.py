@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 from pathlib import Path
@@ -27,11 +28,18 @@ endpoint = next(arg for arg in args if arg == "user" or arg.startswith("repos/")
 method = args[args.index("--method") + 1] if "--method" in args else "GET"
 body = json.load(sys.stdin) if method in {"POST", "PATCH"} else None
 with (root / "calls.jsonl").open("a") as calls:
-    calls.write(json.dumps({"method": method, "endpoint": endpoint, "body": body}) + "\n")
+    calls.write(json.dumps({"method": method, "endpoint": endpoint, "body": body,
+                            "paginate": "--paginate" in args, "slurp": "--slurp" in args}) + "\n")
+
+if any(method == failure["method"] and endpoint.endswith(failure["endpoint"])
+       for failure in data.get("fail_requests", [])):
+    sys.exit("Injected GitHub API failure: " + method + " " + endpoint)
 
 if method in {"POST", "PATCH"}:
-    value = {"id": 10, "user": {"login": "ecoscope-elebot"}, **body}
-    (root / "comment.json").write_text(json.dumps(value))
+    number = endpoint.split("/")[-2] if method == "POST" else None
+    comment_id = int(number) + 1 if number else int(endpoint.split("/")[-1])
+    value = {"id": comment_id, "user": {"login": "ecoscope-elebot"}, **body}
+    (root / f"comment-{comment_id}.json").write_text(json.dumps(value))
 elif endpoint == "user":
     value = {"login": "ecoscope-elebot"}
 elif endpoint.endswith("/attempts/1/jobs?per_page=100"):
@@ -52,12 +60,17 @@ elif endpoint.endswith("/runs/100"):
         value["run_attempt"] = 2
 elif "/pulls/" in endpoint or "/compare/" in endpoint:
     sys.exit("Delivery must not recompute release policy: " + endpoint)
-elif endpoint.endswith("/issues/9/comments?per_page=100"):
-    value = [data["comments"]]
-elif endpoint.endswith("/issues/9"):
-    value = data.get("issue", {"number": 9})
-elif endpoint.endswith("/issues/comments/10"):
-    value = json.loads((root / "comment.json").read_text())
+elif "/issues/comments/" in endpoint:
+    comment_id = endpoint.split("/")[-1]
+    value = json.loads((root / f"comment-{comment_id}.json").read_text())
+elif "/issues/" in endpoint:
+    number = endpoint.split("/issues/", 1)[1].split("/", 1)[0]
+    if endpoint.endswith("/comments?per_page=100"):
+        value = data.get("comment_pages", {}).get(number)
+        if value is None:
+            value = [data.get("comments_by_issue", {}).get(number, data["comments"])]
+    else:
+        value = data.get("issues", {}).get(number, data.get("issue", {"number": int(number)}))
 else:
     sys.exit("Unexpected gh request: " + endpoint)
 
@@ -143,10 +156,13 @@ def fixture(phase="ready", producer="production-pr-readiness.yml"):
 
 
 class FeatureMessageWorkflowTest(unittest.TestCase):
-    def run_workflow(self, data, phase="ready"):
+    def run_workflow(self, data, phase="ready", all_calls=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "fixture.json").write_text(json.dumps(data))
+            for comment in data["comments"]:
+                if "id" in comment:
+                    (root / f"comment-{comment['id']}.json").write_text(json.dumps(comment))
             with zipfile.ZipFile(root / "artifact.zip", "w") as archive:
                 archive.writestr("feature-notifications.json", json.dumps(data["envelope"]))
             for name, program in {"gh": GH, "curl": CURL}.items():
@@ -160,7 +176,7 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
             script = textwrap.dedent(workflow.split("        run: |\n", 1)[1])
             env = {
                 **os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
-                "FIXTURES": str(root), "GH_TOKEN": "fake-token", "SLACK_BOT_TOKEN": "fake-token",
+                "FIXTURES": str(root), "GH_TOKEN": "fake-token", "SLACK_BOT_TOKEN": data.get("slack_token", "fake-token"),
                 "SLACK_MEMBERS": data.get("slack_members", '{"enlivn":"U0123"}'),
                 "SOURCE_RUN_ID": "100", "SOURCE_RUN_ATTEMPT": "1", "NOTIFICATION_PHASE": phase,
                 "GITHUB_REPOSITORY": "wildlife-dynamics/.github",
@@ -170,7 +186,7 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
             log = root / "calls.jsonl"
             calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
             writes = [call for call in calls if call["method"] != "GET"]
-            return result, writes
+            return result, calls if all_calls else writes
 
     def assert_delivered(self, data, phase="ready"):
         result, writes = self.run_workflow(data, phase)
@@ -181,6 +197,144 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
         result, writes = self.run_workflow(data, phase)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(writes, [], result.stdout + result.stderr)
+
+    def github_only_fixture(self, phase="stage-pr-merged", producer="stage.yaml"):
+        data = fixture(phase, producer)
+        message = data["envelope"]["notifications"][0]
+        message["send_to_slack"] = False
+        del message["slack_text"]
+        del message["slack_users"]
+        data.update(comments=[], slack_members="invalid JSON", slack_token="")
+        return data
+
+    def test_github_only_stage_and_production_need_no_slack_fields_or_configuration(self):
+        for phase, producer in (("stage-pr-merged", "stage.yaml"), ("", "prod.yaml")):
+            with self.subTest(producer=producer):
+                data = self.github_only_fixture(phase, producer)
+                result, calls = self.run_workflow(data, phase, all_calls=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                writes = [call for call in calls if call["method"] != "GET"]
+                self.assertEqual([call["method"] for call in writes], ["POST"])
+                message = data["envelope"]["notifications"][0]
+                self.assertEqual(writes[0]["body"], {"body": message["marker"] + "\n" + message["github_text"]})
+                self.assertTrue(any(call["paginate"] and call["slurp"] and
+                                    call["endpoint"].endswith("/issues/9/comments?per_page=100") for call in calls))
+
+    def test_github_only_ignores_valid_malformed_and_duplicate_slack_threads(self):
+        valid = fixture()["comments"][0]
+        malformed = {"user": {"login": "ecoscope-elebot"}, "body":
+                     "<!-- feature-ready-to-ship-to-production -->\n<!-- feature-slack-thread:v1 {bad -->"}
+        for comments in ([valid], [malformed], [valid, valid]):
+            with self.subTest(comments=comments):
+                data = self.github_only_fixture()
+                data["comments"] = comments
+                result, writes = self.run_workflow(data, "stage-pr-merged")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([call["method"] for call in writes], ["POST"])
+
+    def test_github_only_retry_reuses_exact_comment_and_ignores_slack_receipts(self):
+        data = self.github_only_fixture()
+        result, writes = self.run_workflow(data, "stage-pr-merged")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        posted = {"id": 10, "user": {"login": "ecoscope-elebot"}, **writes[0]["body"]}
+        for receipt in ("", "\n<!-- promotion-slack-pending -->", "\n<!-- promotion-slack-sent:{} -->"):
+            with self.subTest(receipt=receipt):
+                data["comments"] = [{**posted, "body": posted["body"] + receipt}]
+                result, retry_writes = self.run_workflow(data, "stage-pr-merged")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(retry_writes, [])
+
+    def test_github_only_requires_real_issue_and_unambiguous_bot_marker(self):
+        data = self.github_only_fixture()
+        data["issue"] = {"number": 9, "pull_request": {"url": "https://example.test/pr"}}
+        self.assert_rejected(data, "stage-pr-merged")
+        data = self.github_only_fixture()
+        comment = {"id": 10, "user": {"login": "ecoscope-elebot"}, "body": MARKER + "\noriginal"}
+        data["comment_pages"] = {"9": [[comment], [comment]]}
+        self.assert_rejected(data, "stage-pr-merged")
+
+    def test_github_only_does_not_reuse_other_authors_marker(self):
+        data = self.github_only_fixture()
+        data["comments"] = [{"user": {"login": "enlivn"}, "body": MARKER}]
+        result, writes = self.run_workflow(data, "stage-pr-merged")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([call["method"] for call in writes], ["POST"])
+
+    def test_github_only_api_errors_fail_batch_and_attempt_remaining_entries(self):
+        for method, endpoint in (("GET", "/issues/9"), ("GET", "/issues/9/comments?per_page=100"),
+                                 ("POST", "/issues/9/comments")):
+            with self.subTest(method=method, endpoint=endpoint):
+                data = self.github_only_fixture()
+                second = copy.deepcopy(data["envelope"]["notifications"][0])
+                second["issue_number"] = "10"
+                data["envelope"]["notifications"].append(second)
+                data["fail_requests"] = [{"method": method, "endpoint": endpoint}]
+                result, calls = self.run_workflow(data, "stage-pr-merged", all_calls=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("Injected GitHub API failure", result.stderr)
+                self.assertTrue(any(call["method"] == "POST" and call["endpoint"].endswith("/issues/10/comments")
+                                    for call in calls))
+                self.assertFalse(any(call["method"] in {"SLACK", "PATCH"} for call in calls))
+
+    def test_mixed_batch_routes_only_requested_messages_to_slack(self):
+        for explicit in (False, True):
+            with self.subTest(explicit_send_to_slack=explicit):
+                data = fixture()
+                if explicit:
+                    data["envelope"]["notifications"][0]["send_to_slack"] = True
+                only = self.github_only_fixture()["envelope"]["notifications"][0]
+                only["issue_number"] = "10"
+                data["envelope"]["notifications"].append(only)
+                data["comments_by_issue"] = {"10": []}
+                result, writes = self.run_workflow(data)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([call["method"] for call in writes], ["POST", "PATCH", "SLACK", "PATCH", "POST"])
+                self.assertEqual(writes[-1]["endpoint"], "repos/wildlife-dynamics/compose/issues/10/comments")
+
+    def test_github_only_success_does_not_mask_missing_requested_slack_threads(self):
+        data = self.github_only_fixture("ready", "production-pr-readiness.yml")
+        requested = fixture()["envelope"]["notifications"][0]
+        requested["issue_number"] = "10"
+        data["envelope"]["notifications"].append(requested)
+        result, writes = self.run_workflow(data)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("None of the linked tickets has a saved Slack thread", result.stderr)
+        self.assertEqual([call["method"] for call in writes], ["POST"])
+
+    def test_nonboolean_send_to_slack_flags_reject_entire_batch_before_writes(self):
+        for flag in (None, 0, 1, "false", "true", [], {}):
+            with self.subTest(flag=flag):
+                data = self.github_only_fixture()
+                invalid = copy.deepcopy(data["envelope"]["notifications"][0])
+                invalid.update(issue_number="10", send_to_slack=flag)
+                data["envelope"]["notifications"].append(invalid)
+                self.assert_rejected(data, "stage-pr-merged")
+
+    def test_github_only_optional_slack_fields_are_validated_when_present(self):
+        for field, value in (("slack_text", None), ("slack_text", {}), ("slack_text", 1),
+                             ("slack_text", "x" * 2501), ("slack_users", None), ("slack_users", {}),
+                             ("slack_users", ["invalid user"]), ("slack_users", ["user"] * 26)):
+            with self.subTest(field=field, value=value):
+                data = self.github_only_fixture()
+                data["envelope"]["notifications"][0][field] = value
+                self.assert_rejected(data, "stage-pr-merged")
+        for text, users in (("Valid optional text", ["enlivn"]), ("", [])):
+            with self.subTest(text=text, users=users):
+                data = self.github_only_fixture()
+                data["envelope"]["notifications"][0].update(slack_text=text, slack_users=users)
+                result, writes = self.run_workflow(data, "stage-pr-merged")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([call["method"] for call in writes], ["POST"])
+
+    def test_slack_delivery_still_requires_fields_for_absent_or_true_flag(self):
+        for explicit in (False, True):
+            for field in ("slack_text", "slack_users"):
+                with self.subTest(explicit=explicit, field=field):
+                    data = fixture()
+                    if explicit:
+                        data["envelope"]["notifications"][0]["send_to_slack"] = True
+                    del data["envelope"]["notifications"][0][field]
+                    self.assert_rejected(data)
 
     def test_open_readiness_checkpoint_delivers_while_producer_runs(self):
         for event in ("pull_request", "pull_request_target", "workflow_dispatch"):
