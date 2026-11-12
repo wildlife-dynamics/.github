@@ -1,5 +1,6 @@
-# Delivery only: callers supply the complete text, recipients, issue, and stable delivery marker.
-name: Deliver a Feature or Bug message to GitHub and Slack
+# Delivery only: callers supply the text, issue, stable marker, and optional per-message slack boolean.
+# Omitted/true slack keeps GitHub + Slack delivery; false needs no Slack fields or saved thread.
+name: Deliver an issue message to GitHub and optionally Slack
 run-name: Issue notification for run ${{ inputs.source_run_id }} attempt ${{ inputs.source_run_attempt }}
 
 on:
@@ -84,8 +85,8 @@ jobs:
                   else error("Invalid Slack member ID") end] | unique | join(" ") end'
           }
           deliver() {
-            local notification number marker github_text slack_text slack_users issue comments comment mentions
-            local metadata id path payload status current state reply feature_failed failures=0 threaded=0
+            local notification number marker github_text slack slack_text slack_users issue comments comment mentions
+            local metadata id path payload status current state reply feature_failed failures=0 threaded=0 slack_requested=0
             # Read each prepared notification as JSON data. No message text is evaluated as shell code.
             # A failed delivery should not prevent attempts for other issues; fail the run afterward.
             while IFS= read -r notification; do
@@ -93,8 +94,8 @@ jobs:
               number=$(printf '%s' "$notification" | jq -er .issue_number)
               marker=$(printf '%s' "$notification" | jq -er .marker)
               github_text=$(printf '%s' "$notification" | jq -er .github_text)
-              slack_text=$(printf '%s' "$notification" | jq -er .slack_text)
-              slack_users=$(printf '%s' "$notification" | jq -ce .slack_users)
+              slack=$(printf '%s' "$notification" | jq -r 'if has("slack") then .slack else true end')
+              if [[ "$slack" == true ]]; then slack_requested=$((slack_requested + 1)); fi
               feature_failed=false
               # The caller selects the issue and people; never turn a PR into an issue-comment target.
               issue=$(api "$endpoint/issues/$number") || { failures=1; continue; }
@@ -106,6 +107,18 @@ jobs:
               comment=$(printf '%s' "$comments" | jq -c --arg marker "$marker" '
                 [.[] | select(.user.login == "ecoscope-elebot" and (.body | startswith($marker)))] |
                 if length > 1 then error("Duplicate notification comments") else .[0] end') || { failures=1; continue; }
+              # GitHub-only messages do not depend on Slack threads, receipts, recipients, or credentials.
+              # Reuse the exact bot comment on retries, even if it already contains Slack receipt markers.
+              if [[ "$slack" == false ]]; then
+                if [[ "$comment" == null ]]; then
+                  verify_source_attempt || return 1
+                  payload=$(jq -n --arg body "$marker"$'\n'"$github_text" '{body:$body}')
+                  printf '%s' "$payload" | api --method POST "$endpoint/issues/$number/comments" --input - >/dev/null || { failures=1; continue; }
+                fi
+                continue
+              fi
+              slack_text=$(printf '%s' "$notification" | jq -er .slack_text)
+              slack_users=$(printf '%s' "$notification" | jq -ce .slack_users)
               # A confirmed Slack receipt means the entire notification is already delivered.
               if [[ "$comment" != null ]] &&
                  printf '%s' "$comment" | jq -e '.body | contains("<!-- promotion-slack-sent:")' >/dev/null; then
@@ -187,7 +200,7 @@ jobs:
                 {body:((.body | split("\n<!-- promotion-slack-pending -->") | join("")) + "\n<!-- promotion-slack-sent:" + $state + " -->")}' |
                 api --method PATCH "$path" --input - --silent || { failures=1; continue; }
             done < <(jq -c '.notifications[]' "$work/messages.json")
-            if [[ "$threaded" == 0 ]]; then
+            if [[ "$slack_requested" -gt 0 && "$threaded" == 0 ]]; then
               fail 'None of the linked tickets has a saved Slack thread.' || true
               return 1
             fi
@@ -253,12 +266,16 @@ jobs:
             .version == 1 and .repository == $repo and .source_run_id == $run and .source_run_attempt == $attempt and
             (.notifications | type == "array" and length > 0 and length <= 50 and
               (unique_by([.issue_number,.marker]) | length) == length and all(.[];
+                (.slack == false) as $github_only |
                 (.issue_number | type == "string" and test("^[1-9][0-9]*$")) and
                 (.marker | type == "string" and test("^<!-- [A-Za-z0-9][A-Za-z0-9 _:=.-]{0,500} -->$")) and
                 (.github_text | type == "string" and length > 0 and length <= 60000 and (contains("<!--") | not)) and
-                (.slack_text | type == "string" and length > 0 and length <= 2500) and
-                (.slack_users | type == "array" and length > 0 and length <= 25 and all(.[];
-                  type == "string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$"))) and
+                ((has("slack") | not) or (.slack | type == "boolean")) and
+                ((.slack == false and (has("slack_text") | not)) or
+                  (.slack_text | type == "string" and (length > 0 or $github_only) and length <= 2500)) and
+                ((.slack == false and (has("slack_users") | not)) or
+                  (.slack_users | type == "array" and (length > 0 or $github_only) and length <= 25 and all(.[];
+                    type == "string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")))) and
                 (.metadata | type == "object" and (tojson | length <= 5000 and (contains("-->") | not)))))' \
             "$work/messages.json" >/dev/null
           if [[ -n "$NOTIFICATION_PHASE" ]]; then
