@@ -15,7 +15,7 @@ OLD_BODY = MARKER + "\n**Bug: Old title**" + SUFFIX
 
 
 def update_fixture():
-    data = fixture(PHASE, "sync-issue-title.yml")
+    data = fixture(PHASE, "sync-issue-title-with-already-sent-notifications.yml")
     data["run"].update(event="issues", head_branch="main")
     data["upload_step"] = "Save feature notifications (issue-title-updated)"
     data["artifact"]["name"] = "feature-notifications-1-issue-title-updated"
@@ -112,6 +112,7 @@ class PreparedIssueUpdateTest(unittest.TestCase):
     def test_provenance_requires_new_workflow_issues_event_main_and_phase(self):
         for changes in ({"event": "workflow_dispatch"}, {"head_branch": "other"},
                         {"path": ".github/workflows/production-pr-readiness.yml"},
+                        {"path": ".github/workflows/sync-issue-title.yml"},
                         {"repository": {"full_name": "untrusted/compose"}},
                         {"head_repository": {"full_name": "untrusted/compose"}}, {"run_attempt": 2}):
             with self.subTest(changes=changes):

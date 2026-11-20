@@ -320,7 +320,7 @@ jobs:
           printf '%s' "$source_run" | jq -e --arg repo "$repo" --arg phase "$NOTIFICATION_PHASE" --argjson attempt "$SOURCE_RUN_ATTEMPT" '
             .repository.full_name == $repo and .head_repository.full_name == $repo and
             .run_attempt == $attempt and
-            (if .path == ".github/workflows/sync-issue-title.yml" then
+            (if .path == ".github/workflows/sync-issue-title-with-already-sent-notifications.yml" then
               .event == "issues" and .head_branch == "main" and $phase == "issue-title-updated"
             else $phase != "issue-title-updated" and (.path | IN(
               ".github/workflows/production-pr-readiness.yml",
