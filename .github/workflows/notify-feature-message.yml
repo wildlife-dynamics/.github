@@ -19,12 +19,18 @@ on:
         type: string
         required: false
         default: ""
+      issue_number:
+        description: Issue serialization key for a prepared root update
+        type: string
+        required: false
+        default: ""
 
 permissions: {}
 
 concurrency:
   # Serialize delivery so two retries cannot send the same unconfirmed message concurrently.
-  group: central-compose-promotion-notifications
+  group: >-
+    ${{ inputs.notification_phase == 'issue-title-updated' && format('central-feature-ready-wildlife-dynamics/compose-{0}', inputs.issue_number) || 'central-compose-promotion-notifications' }}
   cancel-in-progress: false
   queue: max
 
@@ -39,6 +45,7 @@ jobs:
       SOURCE_RUN_ID: ${{ inputs.source_run_id }}
       SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
       NOTIFICATION_PHASE: ${{ inputs.notification_phase }}
+      SOURCE_ISSUE_NUMBER: ${{ inputs.issue_number }}
     steps:
       - name: Verify the message artifact and deliver supplied notifications
         shell: bash
@@ -83,6 +90,96 @@ jobs:
                   $members[$login] | select(. != null) |
                   if type == "string" and test("^[UW][A-Z0-9]+$") then "<@" + . + ">"
                   else error("Invalid Slack member ID") end] | unique | join(" ") end'
+          }
+          # Prepared root updates keep their exact comment tail and destination as write preconditions.
+          # Titles/wording/recipients are selected by the producer, never reconstructed here.
+          update_thread() {
+            jq -ce '
+              if (split("<!-- feature-slack-thread:") | length) != 2 or
+                (split("<!-- feature-ready-slack-sent -->") | length) != 2 or
+                contains("<!-- feature-ready-slack-pending -->") then error("Ambiguous saved thread") else . end |
+              [scan("<!-- feature-slack-thread:v1\\s*([\\s\\S]*?)\\s*-->") | .[0] | fromjson] |
+              if length == 1 and (.[0] | type == "object" and length == 2 and
+                (.channel_id | type == "string" and test("^[CG][A-Z0-9]+$")) and
+                (.thread_ts | type == "string" and test("^[0-9]+\\.[0-9]+$")))
+              then .[0] else error("Invalid saved update thread") end'
+          }
+          update_preconditions() {
+            printf '%s' "$1" | jq -e --argjson message "$notification" --arg endpoint "https://api.github.com/$endpoint" '
+              (.user.login | IN("ecoscope-elebot", "github-actions[bot]")) and
+              (.id | tostring) == $message.comment_id and
+              .issue_url == ($endpoint + "/issues/" + $message.issue_number) and
+              .html_url == ("https://github.com/wildlife-dynamics/compose/issues/" + $message.issue_number + "#issuecomment-" + $message.comment_id) and
+              (.body | startswith($message.marker + "\n") and endswith($message.expected_github_suffix))' >/dev/null
+          }
+          check_update_source() {
+            local issue
+            # Read outside a conditional: API/JSON failures fail delivery, only equality false skips it.
+            issue=$(api "$endpoint/issues/$number")
+            source_matches=$(printf '%s' "$issue" | jq -r --arg number "$number" --argjson fields "$fields" '
+              if type != "object" or (.number | tostring) != $number or .pull_request != null
+              then error("Invalid source issue") else . as $issue |
+                ($fields | to_entries | all(.[]; $issue[.key] == .value)) end')
+            [[ "$source_matches" == true || "$source_matches" == false ]]
+          }
+          deliver_update() {
+            local notification number fields source_matches metadata comment comments id path mentions heading url payload status current
+            notification=$(jq -c '.notifications[0]' "$work/messages.json")
+            number=$(printf '%s' "$notification" | jq -r .issue_number)
+            fields=$(printf '%s' "$notification" | jq -c .source_fields)
+            # Equality is only a freshness guard; stale prepared content must never undo a newer edit.
+            check_update_source
+            if [[ "$source_matches" == false ]]; then
+              echo 'Prepared source fields are stale; skipping both updates.'
+              return 0
+            fi
+            metadata=$(printf '%s' "$notification" | jq '.expected_github_suffix' | update_thread)
+            printf '%s' "$notification" | jq -e --argjson saved "$metadata" '.metadata == $saved' >/dev/null
+            id=$(printf '%s' "$notification" | jq -r .comment_id)
+            path="$endpoint/issues/comments/$id"
+            comments=$(api --paginate --slurp "$endpoint/issues/$number/comments?per_page=100" | jq add)
+            printf '%s' "$comments" | jq -e --argjson message "$notification" '
+              [.[] | select((.user.login | IN("ecoscope-elebot", "github-actions[bot]")) and
+                (.body | startswith($message.marker + "\n")))] |
+              length == 1 and (.[0].id | tostring) == $message.comment_id' >/dev/null
+            comment=$(api "$path")
+            update_preconditions "$comment"
+            # Keep the supplied recipient order; append deliveries retain their existing deduplication.
+            mentions=$(printf '%s' "$SLACK_MEMBERS" | jq -er --argjson users "$(printf '%s' "$notification" | jq -c .slack_users)" '
+              if type != "object" then error("Expected Slack member map") else
+                with_entries(.key |= ascii_downcase) as $members |
+                [$users[] | ascii_downcase | $members[.] |
+                  if type == "string" and test("^[UW][A-Z0-9]+$") then "<@" + . + ">"
+                  else error("Missing or invalid original recipient mapping") end] | join(" ") end')
+            [[ -n "$SLACK_BOT_TOKEN" ]]
+            heading=$(printf '%s' "$notification" | jq -r .slack_heading)
+            url=$(printf '%s' "$comment" | jq -r .html_url)
+            payload=$(printf '%s' "$notification" | jq --arg mentions "$mentions" --arg url "$url" '
+              (.slack_heading + "\n\n" + $mentions + " " + .slack_text) as $text |
+              {channel:.metadata.channel_id,ts:.metadata.thread_ts,text:($text + "\n" + $url),
+               blocks:[{type:"section",text:{type:"mrkdwn",text:$text,verbatim:true}},
+                 {type:"context",elements:[{type:"mrkdwn",text:("<"+$url+"|View GitHub comment>")}]}]}')
+            verify_source_attempt
+            check_update_source
+            if [[ "$source_matches" == false ]]; then echo 'Prepared source fields changed; skipping both updates.'; return 0; fi
+            status=$(curl --silent --show-error --max-time 30 --output "$work/slack" --write-out '%{http_code}' \
+              -H "Authorization: Bearer $SLACK_BOT_TOKEN" -H 'Content-Type: application/json' \
+              --data-binary "$payload" https://slack.com/api/chat.update)
+            [[ "$status" == 200 ]]
+            # Slack can normalize fallback text; validate the supplied displayed heading and root identity.
+            jq -e --argjson saved "$metadata" --arg heading "$heading" '
+              .ok == true and .channel == $saved.channel_id and .ts == $saved.thread_ts and
+              (([.message.blocks[]? | select(.type == "section") | .text.text][0] // .message.text // .text) |
+                split("\n")[0]) == $heading' "$work/slack" >/dev/null
+            verify_source_attempt
+            check_update_source
+            if [[ "$source_matches" == false ]]; then echo 'Prepared source fields changed after Slack update; skipping GitHub update.'; return 0; fi
+            current=$(api "$path")
+            update_preconditions "$current"
+            # Reruns still update Slack even if GitHub already holds the target body.
+            if ! printf '%s' "$current" | jq -e --argjson message "$notification" '.body == $message.github_body' >/dev/null; then
+              printf '%s' "$notification" | jq '{body:.github_body}' | api --method PATCH "$path" --input - --silent
+            fi
           }
           deliver() {
             local notification number marker github_text send_to_slack slack_text slack_users issue comments comment mentions
@@ -220,10 +317,12 @@ jobs:
             [[ "$status" == in_progress || "$status" == completed ]] && break
             sleep 10
           done
-          printf '%s' "$source_run" | jq -e --arg repo "$repo" --argjson attempt "$SOURCE_RUN_ATTEMPT" '
+          printf '%s' "$source_run" | jq -e --arg repo "$repo" --arg phase "$NOTIFICATION_PHASE" --argjson attempt "$SOURCE_RUN_ATTEMPT" '
             .repository.full_name == $repo and .head_repository.full_name == $repo and
             .run_attempt == $attempt and
-            (.path | IN(
+            (if .path == ".github/workflows/sync-issue-title.yml" then
+              .event == "issues" and .head_branch == "main" and $phase == "issue-title-updated"
+            else $phase != "issue-title-updated" and (.path | IN(
               ".github/workflows/production-pr-readiness.yml",
               ".github/workflows/stage-pr-readiness.yml",
               ".github/workflows/stopgap-stage-preview-deploy.yml",
@@ -231,7 +330,7 @@ jobs:
               ".github/workflows/stage.yaml",
               ".github/workflows/prod.yaml",
               ".github/workflows/promote-stage-to-prod.yml")) and
-            (.event | IN("pull_request", "pull_request_target", "workflow_dispatch")) and
+            (.event | IN("pull_request", "pull_request_target", "workflow_dispatch")) end) and
             (.status == "in_progress" or (.status == "completed" and
               (.conclusion | IN("success", "failure", "cancelled"))))' >/dev/null
           verify_source_attempt
@@ -266,7 +365,25 @@ jobs:
             .version == 1 and .repository == $repo and .source_run_id == $run and .source_run_attempt == $attempt and
             (.notifications | type == "array" and length > 0 and length <= 50 and
               (unique_by([.issue_number,.marker]) | length) == length and all(.[];
+                if .operation == "update" then
+                  (.issue_number | type == "string" and test("^[1-9][0-9]*$")) and
+                  (.comment_id | type == "string" and test("^[1-9][0-9]*$")) and
+                  .marker == "<!-- feature-ready-to-ship-to-production -->" and
+                  (.source_fields | type == "object" and length > 0 and (tojson | length <= 5000)) and
+                  (.expected_github_suffix | type == "string" and startswith("\n\n") and length > 2 and length <= 60000) and
+                  (. as $message | .github_body | type == "string" and length <= 60000 and
+                    startswith($message.marker + "\n") and endswith($message.expected_github_suffix)) and
+                  (.slack_heading | type == "string" and length > 0 and length <= 1000 and (contains("\n") | not)) and
+                  (.slack_text | type == "string" and length > 0 and length <= 2500) and
+                  (.slack_users | type == "array" and length > 0 and length <= 25 and all(.[];
+                    type == "string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$"))) and
+                  (.metadata | type == "object" and length == 2 and
+                    (.channel_id | type == "string" and test("^[CG][A-Z0-9]+$")) and
+                    (.thread_ts | type == "string" and test("^[0-9]+\\.[0-9]+$"))) and
+                  (has("send_to_slack") | not)
+                else
                 (.send_to_slack == false) as $github_only |
+                ((has("operation") | not) or .operation == "append") and
                 (.issue_number | type == "string" and test("^[1-9][0-9]*$")) and
                 (.marker | type == "string" and test("^<!-- [A-Za-z0-9][A-Za-z0-9 _:=.-]{0,500} -->$")) and
                 (.github_text | type == "string" and length > 0 and length <= 60000 and (contains("<!--") | not)) and
@@ -276,13 +393,20 @@ jobs:
                 ((.send_to_slack == false and (has("slack_users") | not)) or
                   (.slack_users | type == "array" and (length > 0 or $github_only) and length <= 25 and all(.[];
                     type == "string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")))) and
-                (.metadata | type == "object" and (tojson | length <= 5000 and (contains("-->") | not)))))' \
+                (.metadata | type == "object" and (tojson | length <= 5000 and (contains("-->") | not))) end))' \
             "$work/messages.json" >/dev/null
           if [[ -n "$NOTIFICATION_PHASE" ]]; then
             jq -e --arg phase "$NOTIFICATION_PHASE" '.outcome == $phase' "$work/messages.json" >/dev/null
           fi
+          if [[ "$NOTIFICATION_PHASE" == issue-title-updated ]]; then
+            [[ "$SOURCE_ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]]
+            jq -e --arg number "$SOURCE_ISSUE_NUMBER" '
+              .notifications | length == 1 and all(.[]; .operation == "update" and .issue_number == $number)' "$work/messages.json" >/dev/null
+          else
+            jq -e '.notifications | all(.[]; .operation != "update")' "$work/messages.json" >/dev/null
+          fi
           # Recheck the source attempt immediately before delivery.
           verify_source_attempt
           # Only verified caller-supplied messages reach GitHub and Slack. Delivery markers handle retries.
-          deliver
-          echo 'Supplied notifications delivered or already confirmed.'
+          if [[ "$NOTIFICATION_PHASE" == issue-title-updated ]]; then deliver_update; else deliver; fi
+          echo 'Supplied notifications processed.'
