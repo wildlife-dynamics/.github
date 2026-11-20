@@ -41,7 +41,7 @@ if method in {"POST", "PATCH"}:
     value = {"id": comment_id, "user": {"login": "ecoscope-elebot"}, **body}
     (root / f"comment-{comment_id}.json").write_text(json.dumps(value))
 elif endpoint == "user":
-    value = {"login": "ecoscope-elebot"}
+    value = {"login": data.get("login", "ecoscope-elebot")}
 elif endpoint.endswith("/attempts/1/jobs?per_page=100"):
     value = [{"jobs": [{"steps": [{"name": data["upload_step"], "conclusion": data.get("upload_conclusion", "success")}]}]}]
 elif endpoint.endswith("/artifacts?per_page=100"):
@@ -62,7 +62,7 @@ elif "/pulls/" in endpoint or "/compare/" in endpoint:
     sys.exit("Delivery must not recompute release policy: " + endpoint)
 elif "/issues/comments/" in endpoint:
     comment_id = endpoint.split("/")[-1]
-    value = json.loads((root / f"comment-{comment_id}.json").read_text())
+    value = data.get("current_comment", json.loads((root / f"comment-{comment_id}.json").read_text()))
 elif "/issues/" in endpoint:
     number = endpoint.split("/issues/", 1)[1].split("/", 1)[0]
     if endpoint.endswith("/comments?per_page=100"):
@@ -70,7 +70,11 @@ elif "/issues/" in endpoint:
         if value is None:
             value = [data.get("comments_by_issue", {}).get(number, data["comments"])]
     else:
+        if data.get("fail_issue_after_slack") and "SLACK" in (root / "calls.jsonl").read_text():
+            sys.exit("Injected GitHub issue read failure after Slack")
         value = data.get("issues", {}).get(number, data.get("issue", {"number": int(number)}))
+        if data.get("issue_after_slack") and "SLACK" in (root / "calls.jsonl").read_text():
+            value = data["issue_after_slack"]
 else:
     sys.exit("Unexpected gh request: " + endpoint)
 
@@ -95,12 +99,17 @@ root = Path(os.environ["FIXTURES"])
 args = sys.argv[1:]
 payload = json.loads(args[args.index("--data-binary") + 1])
 with (root / "calls.jsonl").open("a") as calls:
-    calls.write(json.dumps({"method": "SLACK", "endpoint": "chat.postMessage", "body": payload}) + "\n")
-Path(args[args.index("--output") + 1]).write_text(json.dumps({
-    "ok": True, "channel": payload["channel"], "ts": "101.000001",
-    "message": {"thread_ts": payload["thread_ts"]},
-}))
-print("200", end="")
+    calls.write(json.dumps({"method": "SLACK", "endpoint": args[-1].rsplit("/", 1)[-1], "body": payload}) + "\n")
+data = json.loads((root / "fixture.json").read_text())
+if data.get("slack_failure"):
+    sys.exit("Injected Slack failure")
+response = {"ok": True, "channel": payload["channel"], "ts": "101.000001",
+            "message": {"thread_ts": payload.get("thread_ts")}}
+if args[-1].endswith("chat.update"):
+    response.update(ts=payload["ts"], message={"blocks": payload["blocks"], "text": "Normalized fallback"})
+response.update(data.get("slack_response", {}))
+Path(args[args.index("--output") + 1]).write_text(json.dumps(response))
+print(data.get("slack_status", "200"), end="")
 '''
 
 
@@ -179,6 +188,7 @@ class FeatureMessageWorkflowTest(unittest.TestCase):
                 "FIXTURES": str(root), "GH_TOKEN": "fake-token", "SLACK_BOT_TOKEN": data.get("slack_token", "fake-token"),
                 "SLACK_MEMBERS": data.get("slack_members", '{"enlivn":"U0123"}'),
                 "SOURCE_RUN_ID": "100", "SOURCE_RUN_ATTEMPT": "1", "NOTIFICATION_PHASE": phase,
+                "SOURCE_ISSUE_NUMBER": data.get("source_issue_number", "9"),
                 "GITHUB_REPOSITORY": "wildlife-dynamics/.github",
                 "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main",
             }
